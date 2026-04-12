@@ -9,6 +9,8 @@ Usage:
 Server mode enables drag-and-drop status changes via a local API.
 """
 
+__version__ = "1.0.0"
+
 import json
 import os
 import subprocess
