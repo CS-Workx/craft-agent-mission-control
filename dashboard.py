@@ -9,7 +9,7 @@ Usage:
 Server mode enables drag-and-drop status changes via a local API.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 import json
 import os
@@ -209,6 +209,11 @@ def build_data(workspaces):
             },
         }
 
+        # Build flat label list for the label picker
+        label_list = []
+        for lb_id, lb_cfg in ws["labels"].items():
+            label_list.append({"id": lb_id, "name": lb_cfg["name"], "cl": lb_cfg["light"], "cd": lb_cfg["dark"]})
+
         ws_list.append({
             "id": ws["dir_name"], "name": ws["name"],
             "wsUuid": ws.get("app_uuid") or ws.get("ws_id", ""),
@@ -216,6 +221,7 @@ def build_data(workspaces):
             "count": len(ws["sessions"]),
             "statuses": sorted(statuses, key=lambda s: s["order"]),
             "theme": ws_theme,
+            "labelDefs": label_list,
         })
 
     sessions = []
@@ -245,6 +251,7 @@ def build_data(workspaces):
                 "msgs": sess.get("messageCount", 0) or 0,
                 "flagged": sess.get("isFlagged", False),
                 "labels": parsed_labels,
+                "rawLabels": sess.get("labels") or [],
                 "tokens": tu.get("totalTokens", 0) or 0,
                 "sdkSid": sess.get("sdkSessionId", ""),
             })
@@ -277,6 +284,61 @@ def update_session_status(ws_dir_name, session_id, new_status):
         return True, f"{old_status} -> {new_status}"
     except Exception as e:
         return False, str(e)
+
+
+def update_session_labels(ws_dir_name, session_id, labels):
+    """Update labels in the first line of session.jsonl."""
+    jsonl = WORKSPACES_DIR / ws_dir_name / "sessions" / session_id / "session.jsonl"
+    if not jsonl.exists():
+        return False, "Session not found"
+    try:
+        with open(jsonl, "r") as f:
+            lines = f.readlines()
+        if not lines:
+            return False, "Empty session file"
+        meta = json.loads(lines[0])
+        meta["labels"] = labels
+        lines[0] = json.dumps(meta, separators=(",", ":")) + "\n"
+        with open(jsonl, "w") as f:
+            f.writelines(lines)
+        return True, labels
+    except Exception as e:
+        return False, str(e)
+
+
+def get_workspace_labels(ws_dir_name):
+    """Return the full label tree for a workspace."""
+    lb_path = WORKSPACES_DIR / ws_dir_name / "labels" / "config.json"
+    if not lb_path.exists():
+        return []
+    try:
+        return json.loads(lb_path.read_text()).get("labels", [])
+    except Exception:
+        return []
+
+
+def get_alerts():
+    """Return sessions needing attention (stale 7d+, open status)."""
+    global NOW_MS
+    NOW_MS = int(time.time() * 1000)
+    workspaces = collect()
+    data = build_data(workspaces)
+    alerts = []
+    for s in data["sessions"]:
+        if s["status"] in ("done", "cancelled"):
+            continue
+        age_days = (NOW_MS - (s.get("lastUsedAt") or 0)) / 86400000
+        if age_days >= 7:
+            alerts.append({
+                "type": "stale",
+                "sessionId": s["id"],
+                "name": s["name"],
+                "workspace": s["wsName"],
+                "wsId": s["wsId"],
+                "staleDays": int(age_days),
+                "status": s["status"],
+            })
+    return alerts
 
 
 # ─── HTML Template ───────────────────────────────────────────────────────────
@@ -454,11 +516,7 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
 .toast.success{{border-left:3px solid var(--ok);color:var(--ok)}}
 .toast.error{{border-left:3px solid var(--er);color:var(--er)}}
 
-.drag-hint{{
-  display:none;margin-left:auto;font-size:11px;color:var(--tx3);
-  font-weight:400;font-style:italic
-}}
-.drag-enabled .drag-hint{{display:inline}}
+.col-new-btn{{width:22px;height:22px;font-size:14px;border-radius:50%;border-width:1px}}
 
 .mode-badge{{
   display:inline-block;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;
@@ -466,6 +524,99 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
 }}
 .mode-manage{{background:var(--oks);color:var(--ok)}}
 .mode-view{{background:var(--acs);color:var(--ac)}}
+
+/* ─── Feature 1: Export ──────────────────────────────── */
+.toolbar-btn{{
+  padding:7px 14px;border-radius:8px;border:1px solid var(--bd);
+  background:var(--input-bg);color:var(--tx);font-size:13px;font-weight:500;
+  cursor:pointer;outline:none;display:inline-flex;align-items:center;gap:6px;transition:all .15s
+}}
+.toolbar-btn:hover{{border-color:var(--ac);color:var(--ac)}}
+.toolbar-btn svg{{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}}
+
+/* ─── Feature 2: New Session ─────────────────────────── */
+.new-btn{{
+  width:28px;height:28px;border-radius:50%;border:2px dashed var(--bd2);
+  background:none;color:var(--tx3);font-size:16px;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;transition:all .15s;flex-shrink:0
+}}
+.new-btn:hover{{border-color:var(--ac);color:var(--ac);background:var(--acs)}}
+.toolbar .new-btn{{width:34px;height:34px;font-size:18px;border-radius:8px}}
+
+/* ─── Feature 3: Label Picker ────────────────────────── */
+.label-btn{{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:3px 8px;border-radius:6px;font-size:11px;font-weight:500;
+  background:transparent;color:var(--tx3);border:none;cursor:pointer;transition:all .15s
+}}
+.label-btn:hover{{background:var(--acs);color:var(--ac)}}
+.label-btn svg{{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}}
+.label-picker{{
+  position:absolute;z-index:50;top:100%;left:0;min-width:200px;max-width:260px;max-height:280px;overflow-y:auto;
+  background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r);box-shadow:var(--sh2);padding:6px
+}}
+.label-picker-item{{
+  display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;font-size:12px;transition:background .1s
+}}
+.label-picker-item:hover{{background:var(--acs)}}
+.label-dot{{width:10px;height:10px;border-radius:50%;flex-shrink:0}}
+.label-check{{width:14px;height:14px;flex-shrink:0;accent-color:var(--ac)}}
+
+/* ─── Feature 4: Batch Operations ────────────────────── */
+.card-check-wrap{{display:none;position:absolute;top:10px;left:-4px;z-index:5}}
+.select-mode .card-check-wrap{{display:block}}
+.card-check{{width:16px;height:16px;accent-color:var(--ac);cursor:pointer}}
+.card{{position:relative}}
+.card.selected{{border-color:var(--ac);background:var(--acs)}}
+.batch-bar{{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:100;
+  display:flex;align-items:center;gap:12px;padding:10px 20px;
+  background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r);
+  box-shadow:var(--sh2);backdrop-filter:blur(12px)
+}}
+.batch-bar .select{{font-size:12px;padding:6px 10px}}
+.batch-count{{font-size:13px;font-weight:600;color:var(--ac)}}
+.batch-apply{{
+  padding:6px 14px;border-radius:6px;border:none;font-size:12px;font-weight:600;
+  background:var(--ac);color:#fff;cursor:pointer;transition:opacity .15s
+}}
+.batch-apply:hover{{opacity:.85}}
+.batch-deselect{{
+  padding:6px 14px;border-radius:6px;border:1px solid var(--bd);font-size:12px;font-weight:500;
+  background:transparent;color:var(--tx2);cursor:pointer
+}}
+.batch-deselect:hover{{color:var(--tx);border-color:var(--bd2)}}
+
+/* ─── Feature 5: Archive View ────────────────────────── */
+.view-tabs{{display:flex;gap:2px;background:var(--input-bg);border-radius:8px;padding:2px}}
+.view-tab{{
+  padding:6px 16px;border-radius:6px;border:none;font-size:13px;font-weight:500;
+  background:transparent;color:var(--tx2);cursor:pointer;transition:all .15s
+}}
+.view-tab.active{{background:var(--bg2);color:var(--tx);box-shadow:var(--sh)}}
+.archive-view{{display:none}}
+.archive-view.active{{display:block}}
+.archive-filters{{display:flex;gap:10px;align-items:center;margin-bottom:16px;flex-wrap:wrap}}
+.archive-filters .select{{font-size:12px;padding:6px 10px}}
+.archive-table{{width:100%;border-collapse:collapse;font-size:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden}}
+.archive-table th{{text-align:left;padding:10px 14px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--tx3);border-bottom:1px solid var(--bd);cursor:pointer;user-select:none;background:var(--bg3)}}
+.archive-table th:hover{{color:var(--tx)}}
+.archive-table th .arrow{{margin-left:4px;font-size:9px;opacity:.5}}
+.archive-table th.sorted .arrow{{opacity:1;color:var(--ac)}}
+.archive-table td{{padding:8px 14px;border-bottom:1px solid var(--bd);color:var(--tx2)}}
+.archive-table .cn{{font-weight:500;color:var(--tx)!important;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.archive-actions{{display:flex;gap:6px}}
+.reopen-btn{{
+  padding:3px 10px;border-radius:6px;font-size:11px;font-weight:500;
+  background:var(--acs);color:var(--ac);border:none;cursor:pointer;transition:all .15s
+}}
+.reopen-btn:hover{{background:var(--ac);color:#fff}}
+.archive-page{{display:flex;align-items:center;justify-content:center;gap:12px;padding:16px;font-size:13px;color:var(--tx2)}}
+.archive-page button{{
+  padding:6px 14px;border-radius:6px;border:1px solid var(--bd);font-size:12px;
+  background:var(--input-bg);color:var(--tx);cursor:pointer
+}}
+.archive-page button:disabled{{opacity:.3;cursor:default}}
 </style>
 </head>
 <body>
@@ -475,7 +626,7 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
       <div class="htop-left">
         <h1>Mission Control</h1>
         <span id="mode-badge" class="mode-badge"></span>
-        <span class="ts">Updated {ts}</span>
+        <span class="ts" title="Updated {ts}">v{__version__}</span>
       </div>
     </div>
     <div class="stats" id="stats"></div>
@@ -485,6 +636,12 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
     <select class="select ws-selector" id="ws-select">
       <option value="all">All Workspaces</option>
     </select>
+
+
+    <div class="view-tabs" id="view-tabs">
+      <button class="view-tab active" data-view="board">Board</button>
+      <button class="view-tab" data-view="archive">Archive</button>
+    </div>
     <div class="toolbar-right">
       <div class="search-wrap">
         <span class="search-icon">&#x1F50D;</span>
@@ -497,29 +654,79 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
         <option value="messages">Sort: Messages</option>
         <option value="staleness">Sort: Most Stale</option>
       </select>
+      <button class="toolbar-btn" id="select-toggle" title="Select multiple sessions">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 12l2 2 4-4"/></svg>
+      </button>
+      <button class="toolbar-btn" id="export-btn" title="Export visible sessions as CSV">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        CSV
+      </button>
     </div>
   </div>
 
   <div class="filters" id="filters"></div>
-  <div class="board" id="board"></div>
 
-  <div class="closed-section" id="closed-section">
-    <button class="closed-toggle" id="closed-toggle">
-      <span class="closed-arrow">&#9654;</span>
-      <span id="closed-label">Closed Sessions</span>
-    </button>
-    <div class="closed-body">
-      <table class="ct">
-        <thead><tr>
-          <th data-key="name">Session <span class="arrow">&uarr;</span></th>
-          <th data-key="ws">Workspace <span class="arrow">&uarr;</span></th>
-          <th data-key="status">Status <span class="arrow">&uarr;</span></th>
-          <th data-key="activity">Last Activity <span class="arrow">&uarr;</span></th>
-          <th data-key="cost">Cost <span class="arrow">&uarr;</span></th>
-        </tr></thead>
-        <tbody id="closed-body"></tbody>
-      </table>
+  <!-- Board view (default) -->
+  <div id="board-view">
+    <div class="board" id="board"></div>
+    <div class="closed-section" id="closed-section">
+      <button class="closed-toggle" id="closed-toggle">
+        <span class="closed-arrow">&#9654;</span>
+        <span id="closed-label">Closed Sessions</span>
+      </button>
+      <div class="closed-body">
+        <table class="ct">
+          <thead><tr>
+            <th data-key="name">Session <span class="arrow">&uarr;</span></th>
+            <th data-key="ws">Workspace <span class="arrow">&uarr;</span></th>
+            <th data-key="status">Status <span class="arrow">&uarr;</span></th>
+            <th data-key="activity">Last Activity <span class="arrow">&uarr;</span></th>
+            <th data-key="cost">Cost <span class="arrow">&uarr;</span></th>
+          </tr></thead>
+          <tbody id="closed-body"></tbody>
+        </table>
+      </div>
     </div>
+  </div>
+
+  <!-- Archive view -->
+  <div id="archive-view" class="archive-view">
+    <div class="archive-filters">
+      <select class="select" id="archive-status"><option value="all">All Closed</option></select>
+      <select class="select" id="archive-ws"><option value="all">All Workspaces</option></select>
+      <select class="select" id="archive-date">
+        <option value="all">All Time</option>
+        <option value="7">Last 7 Days</option>
+        <option value="30">Last 30 Days</option>
+        <option value="90">Last 90 Days</option>
+      </select>
+      <div class="search-wrap" style="width:200px;min-width:140px">
+        <span class="search-icon">&#x1F50D;</span>
+        <input type="text" class="search-box" id="archive-search" placeholder="Search archive\u2026" autocomplete="off">
+      </div>
+    </div>
+    <table class="archive-table" id="archive-table">
+      <thead><tr>
+        <th data-key="name">Session <span class="arrow">&uarr;</span></th>
+        <th data-key="ws">Workspace <span class="arrow">&uarr;</span></th>
+        <th data-key="status">Status <span class="arrow">&uarr;</span></th>
+        <th data-key="activity">Last Activity <span class="arrow">&uarr;</span></th>
+        <th data-key="created">Created <span class="arrow">&uarr;</span></th>
+        <th data-key="cost">Cost <span class="arrow">&uarr;</span></th>
+        <th data-key="msgs">Msgs <span class="arrow">&uarr;</span></th>
+        <th>Actions</th>
+      </tr></thead>
+      <tbody id="archive-body"></tbody>
+    </table>
+    <div class="archive-page" id="archive-page"></div>
+  </div>
+
+  <!-- Batch action bar -->
+  <div class="batch-bar" id="batch-bar" style="display:none">
+    <span class="batch-count" id="batch-count">0 selected</span>
+    <select class="select" id="batch-status-select"></select>
+    <button class="batch-apply" id="batch-apply-status">Move</button>
+    <button class="batch-deselect" id="batch-deselect">Deselect All</button>
   </div>
 </div>
 <div class="toast-container" id="toasts"></div>
@@ -538,6 +745,16 @@ const state = {{
   expanded: null,
   closedSort: {{ key: 'activity', asc: false }},
   dragging: null,
+  // Feature 4: Batch
+  selected: new Set(),
+  selectMode: false,
+  // Feature 5: Archive
+  view: 'board',
+  archiveSort: {{ key: 'activity', asc: false }},
+  archivePage: 0,
+  archivePageSize: 25,
+  // Feature 3: Label picker
+  labelPicker: null,
 }};
 
 // ─── Helpers ─────────────────────────────────────────
@@ -549,6 +766,11 @@ function relTime(ms) {{
   if (d < 86400) return Math.floor(d/3600) + 'h ago';
   const days = Math.floor(d/86400);
   return days + ' day' + (days !== 1 ? 's' : '') + ' ago';
+}}
+
+function fmtDate(ms) {{
+  if (!ms) return '?';
+  return new Date(ms).toLocaleDateString('en-GB',{{day:'numeric',month:'short',year:'numeric'}});
 }}
 
 function stale(ms) {{
@@ -571,25 +793,23 @@ function isManageMode() {{ return state.selectedWs !== 'all'; }}
 
 function getWsConfig(wsId) {{ return DATA.workspaces.find(w => w.id === wsId); }}
 
+function cardKey(s) {{ return s.wsId + ':' + s.id; }}
+
 function getStatusColumns() {{
   if (isManageMode()) {{
     const ws = getWsConfig(state.selectedWs);
     return ws ? ws.statuses : [];
   }}
-  // All workspaces overview: show columns that have visible sessions + always-show columns
   const closedIds = new Set(getClosedStatuses().map(s => s.id));
   const ALWAYS_SHOW = new Set(['todo', 'automated']);
-  // Build a map of all known open status definitions
   const statusMap = {{}};
   for (const ws of DATA.workspaces) {{
     for (const s of ws.statuses) {{
       if (s.category === 'open' && !statusMap[s.id]) statusMap[s.id] = s;
     }}
   }}
-  // Find which statuses actually have visible sessions
   const visibleSessions = DATA.sessions.filter(s => !closedIds.has(s.status) && matchesFilters(s));
   const usedStatuses = new Set(visibleSessions.map(s => s.status));
-  // Include: always-show columns + any column with sessions
   const cols = [];
   const seen = new Set();
   for (const [id, def] of Object.entries(statusMap)) {{
@@ -598,7 +818,6 @@ function getStatusColumns() {{
       seen.add(id);
     }}
   }}
-  // Catch any referenced status not in any workspace definition
   for (const id of usedStatuses) {{
     if (!seen.has(id)) {{
       cols.push({{ id, label: id.replace(/-/g,' ').replace(/\\b\\w/g,c=>c.toUpperCase()), category:'open', order: 99 }});
@@ -619,6 +838,17 @@ function getClosedStatuses() {{
     }}
   }}
   return result;
+}}
+
+function getAllStatuses() {{
+  const seen = new Set();
+  const result = [];
+  for (const ws of DATA.workspaces) {{
+    for (const s of ws.statuses) {{
+      if (!seen.has(s.id)) {{ seen.add(s.id); result.push(s); }}
+    }}
+  }}
+  return result.sort((a,b) => (a.order||0) - (b.order||0));
 }}
 
 function matchesFilters(s) {{
@@ -670,7 +900,6 @@ async function updateStatus(sessionId, wsId, newStatus) {{
     }});
     const data = await res.json();
     if (data.ok) {{
-      // Update local data
       const sess = DATA.sessions.find(s => s.id === sessionId && s.wsId === wsId);
       if (sess) sess.status = newStatus;
       toast('Moved to ' + newStatus.replace(/-/g, ' '));
@@ -678,6 +907,30 @@ async function updateStatus(sessionId, wsId, newStatus) {{
       return true;
     }} else {{
       toast(data.error || 'Update failed', 'error');
+      return false;
+    }}
+  }} catch (e) {{
+    toast('Connection error: ' + e.message, 'error');
+    return false;
+  }}
+}}
+
+async function updateLabels(sessionId, wsId, labels) {{
+  if (!API) {{ toast('Server mode required', 'error'); return false; }}
+  try {{
+    const res = await fetch(API + '/api/labels', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ sessionId, wsDir: wsId, labels }}),
+    }});
+    const data = await res.json();
+    if (data.ok) {{
+      const sess = DATA.sessions.find(s => s.id === sessionId && s.wsId === wsId);
+      if (sess) sess.rawLabels = data.labels;
+      toast('Labels updated');
+      return true;
+    }} else {{
+      toast(data.error || 'Label update failed', 'error');
       return false;
     }}
   }} catch (e) {{
@@ -708,6 +961,89 @@ async function openSession(btn) {{
   }} catch (e) {{
     await navigator.clipboard.writeText(sessionName);
     toast('Copied \u201c' + sessionName + '\u201d \u2014 press \u2318K in Craft Agents to search');
+  }}
+}}
+
+// Feature 2: New session via deeplink
+async function newSession(wsId) {{
+  const ws = getWsConfig(wsId || state.selectedWs);
+  if (!ws) return;
+  const url = ws.wsUuid
+    ? 'craftagents://workspace/' + ws.wsUuid + '/action/new-chat?window=focused'
+    : 'craftagents://action/new-chat?window=focused';
+  if (API) {{
+    try {{
+      const res = await fetch(API + '/api/open-url', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ url }}),
+      }});
+      const data = await res.json();
+      if (data.ok) toast('Opening new session\u2026');
+      else toast('Could not open Craft Agents', 'error');
+    }} catch (e) {{
+      toast('Connection error', 'error');
+    }}
+  }} else {{
+    window.location.href = url;
+  }}
+}}
+
+// Feature 1: CSV Export
+function exportCSV() {{
+  const sessions = DATA.sessions.filter(matchesFilters).sort(sortFn(state.sort));
+  if (!sessions.length) {{ toast('No sessions to export', 'error'); return; }}
+  const cols = ['Name','Session ID','Workspace','Status','Last Activity','Created','Cost','Messages','Model','Labels','Tokens'];
+  const rows = sessions.map(s => [
+    '"' + (s.name||'').replace(/"/g,'""') + '"',
+    s.id,
+    '"' + (s.wsName||'').replace(/"/g,'""') + '"',
+    s.status,
+    s.lastUsedAt ? new Date(s.lastUsedAt).toISOString() : '',
+    s.createdAt ? new Date(s.createdAt).toISOString() : '',
+    (s.cost||0).toFixed(4),
+    s.msgs||0,
+    s.model||'',
+    '"' + (s.rawLabels||[]).join(';').replace(/"/g,'""') + '"',
+    s.tokens||0,
+  ]);
+  const csv = [cols.join(','), ...rows.map(r => r.join(','))].join('\\n');
+  const blob = new Blob([csv], {{type: 'text/csv;charset=utf-8;'}});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'mission-control-' + new Date().toISOString().slice(0,10) + '.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast('Exported ' + sessions.length + ' sessions');
+}}
+
+// Feature 4: Batch operations
+async function batchUpdateStatus(newStatus) {{
+  if (!API || !state.selected.size) return;
+  const items = [...state.selected].map(k => {{ const [ws, id] = k.split(':'); return {{ sessionId: id, wsDir: ws }}; }});
+  try {{
+    const res = await fetch(API + '/api/batch/status', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ items, newStatus }}),
+    }});
+    const data = await res.json();
+    if (data.ok) {{
+      items.forEach(i => {{
+        const sess = DATA.sessions.find(s => s.id === i.sessionId && s.wsId === i.wsDir);
+        if (sess) sess.status = newStatus;
+      }});
+      toast(`Moved ${{data.updated}} session${{data.updated!==1?'s':''}} to ${{newStatus.replace(/-/g,' ')}}`);
+      state.selected.clear();
+      state.selectMode = false;
+      document.querySelector('.wrap').classList.remove('select-mode');
+      renderAll();
+      renderBatchBar();
+    }} else {{
+      toast(data.error || 'Batch update failed', 'error');
+    }}
+  }} catch (e) {{
+    toast('Connection error: ' + e.message, 'error');
   }}
 }}
 
@@ -755,14 +1091,17 @@ function renderFilters() {{
     const c = dark ? ws.cd : ws.cl;
     const st = active ? `background:${{c}};color:#fff;border-color:${{c}}` : `background:transparent;color:${{c}};border-color:${{c}}`;
     return `<span class="fpill ${{active?'active':'inactive'}}" data-ws="${{ws.id}}" style="${{st}}">${{esc(ws.name)}} <span class="pc">${{ws.count}}</span></span>`;
-  }}).join('');
+  }}).join('') + DATA.workspaces.map(ws =>
+    `<button class="new-btn" data-newws="${{ws.id}}" title="New session in ${{esc(ws.name)}}">+</button>`
+  ).join('');
 }}
 
 function renderCard(s) {{
   const dark = isDark();
   const wsBg = dark ? s.wsCd : s.wsCl;
   const expanded = state.expanded === s.id;
-  const draggable = isManageMode() && !!API;
+  const draggable = isManageMode() && !!API && !state.selectMode;
+  const isSelected = state.selected.has(cardKey(s));
   const labels = (s.labels||[]).slice(0, expanded ? 20 : 4).map(l => {{
     const c = dark ? l.cd : l.cl;
     return `<span class="label-pill" style="border-color:${{c}};color:${{c}}">${{esc(l.d)}}</span>`;
@@ -771,14 +1110,15 @@ function renderCard(s) {{
   const details = expanded ? `
     <div class="card-details">
       <div class="detail-row"><span class="detail-label">Session ID</span><span>${{esc(s.id)}}</span></div>
-      <div class="detail-row"><span class="detail-label">Created</span><span>${{s.createdAt ? new Date(s.createdAt).toLocaleDateString('en-GB',{{day:'numeric',month:'short',year:'numeric'}}) : '?'}}</span></div>
+      <div class="detail-row"><span class="detail-label">Created</span><span>${{fmtDate(s.createdAt)}}</span></div>
       <div class="detail-row"><span class="detail-label">Tokens</span><span>${{(s.tokens||0).toLocaleString()}}</span></div>
       <div class="detail-row"><span class="detail-label">Cost</span><span>${{fmtCost(s.cost)||'$0.00'}}</span></div>
       <div class="detail-row"><span class="detail-label">Messages</span><span>${{s.msgs}}</span></div>
       <div class="detail-row"><span class="detail-label">Model</span><span>${{s.model||'?'}}</span></div>
     </div>` : '';
 
-  return `<div class="card ${{expanded?'expanded':''}} ${{draggable?'draggable':''}}" data-id="${{s.id}}" data-ws="${{s.wsId}}" ${{draggable?'draggable="true"':''}}>
+  return `<div class="card ${{expanded?'expanded':''}} ${{draggable?'draggable':''}} ${{isSelected?'selected':''}}" data-id="${{s.id}}" data-ws="${{s.wsId}}" ${{draggable?'draggable="true"':''}}>
+  <div class="card-check-wrap"><input type="checkbox" class="card-check" ${{isSelected?'checked':''}}></div>
   <div class="card-top">
     <span class="dot s-${{stale(s.lastUsedAt)}}"></span>
     ${{s.flagged?'<span class="flag">&#9733;</span>':''}}
@@ -793,10 +1133,15 @@ function renderCard(s) {{
   </div>
   <div class="card-meta">
     <span>${{relTime(s.lastUsedAt)}} &middot; ${{s.msgs}} msgs</span>
-    <button class="open-btn" data-sid="${{s.id}}" data-sdksid="${{s.sdkSid}}" data-wsuuid="${{s.wsUuid}}" title="Open in Craft Agents">
-      <svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-      Open
-    </button>
+    <span style="display:flex;gap:4px;align-items:center">
+      ${{API ? `<button class="label-btn" data-sid="${{s.id}}" data-ws="${{s.wsId}}" title="Manage labels">
+        <svg viewBox="0 0 24 24"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+      </button>` : ''}}
+      <button class="open-btn" data-sid="${{s.id}}" data-sdksid="${{s.sdkSid}}" data-wsuuid="${{s.wsUuid}}" title="Open in Craft Agents">
+        <svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        Open
+      </button>
+    </span>
   </div>
   ${{details}}
 </div>`;
@@ -805,8 +1150,6 @@ function renderCard(s) {{
 function renderBoard() {{
   const manage = isManageMode();
   const closedIds = new Set(getClosedStatuses().map(s => s.id));
-  // In manage mode: show ALL sessions (including closed) on the board
-  // In overview mode: only show open sessions
   const boardSessions = manage
     ? DATA.sessions.filter(matchesFilters)
     : DATA.sessions.filter(s => !closedIds.has(s.status) && matchesFilters(s));
@@ -821,7 +1164,7 @@ function renderBoard() {{
     return;
   }}
 
-  boardEl.classList.toggle('drag-enabled', manage && !!API);
+  boardEl.classList.toggle('drag-enabled', manage && !!API && !state.selectMode);
 
   boardEl.innerHTML = statusCols.map(col => {{
     const sessions = boardSessions.filter(s => s.status === col.id).sort(sortFn(state.sort));
@@ -830,20 +1173,18 @@ function renderBoard() {{
     return `<div class="col ${{isClosed ? 'col-closed' : ''}}" data-status="${{col.id}}">
       <div class="col-head ${{isClosed ? 'col-head-closed' : ''}}">
         <span class="col-title">${{esc(col.label)}}</span>
-        <span class="drag-hint">drag to move</span>
         <span class="col-count">${{sessions.length}}</span>
+        ${{manage && !isClosed ? `<button class="new-btn col-new-btn" data-newws="${{state.selectedWs}}" title="New session">+</button>` : ''}}
       </div>
       <div class="col-cards" data-status="${{col.id}}">${{cards}}</div>
     </div>`;
   }}).join('');
 
-  // Attach drag-and-drop if manage mode
-  if (manage && API) setupDragDrop();
+  if (manage && API && !state.selectMode) setupDragDrop();
 }}
 
 function renderClosed() {{
   const section = document.getElementById('closed-section');
-  // In manage mode, closed statuses are on the board — hide this section
   if (isManageMode()) {{
     section.style.display = 'none';
     return;
@@ -882,6 +1223,161 @@ function renderClosed() {{
   }});
 }}
 
+// Feature 5: Archive view
+function renderArchive() {{
+  const closedIds = new Set(getClosedStatuses().map(s => s.id));
+  const statusFilter = document.getElementById('archive-status').value;
+  const wsFilter = document.getElementById('archive-ws').value;
+  const dateFilter = document.getElementById('archive-date').value;
+  const searchQ = (document.getElementById('archive-search').value||'').toLowerCase();
+
+  let sessions = DATA.sessions.filter(s => closedIds.has(s.status));
+
+  if (statusFilter !== 'all') sessions = sessions.filter(s => s.status === statusFilter);
+  if (wsFilter !== 'all') sessions = sessions.filter(s => s.wsId === wsFilter);
+  if (dateFilter !== 'all') {{
+    const cutoff = NOW - parseInt(dateFilter) * 86400000;
+    sessions = sessions.filter(s => (s.lastUsedAt||0) >= cutoff);
+  }}
+  if (searchQ) sessions = sessions.filter(s =>
+    (s.name||'').toLowerCase().includes(searchQ) || (s.wsName||'').toLowerCase().includes(searchQ)
+    || (s.id||'').toLowerCase().includes(searchQ));
+
+  const sk = state.archiveSort.key, dir = state.archiveSort.asc ? 1 : -1;
+  sessions.sort((a, b) => {{
+    if (sk==='name') return dir * (a.name||'').localeCompare(b.name||'');
+    if (sk==='ws') return dir * (a.wsName||'').localeCompare(b.wsName||'');
+    if (sk==='status') return dir * (a.status||'').localeCompare(b.status||'');
+    if (sk==='cost') return dir * ((a.cost||0)-(b.cost||0));
+    if (sk==='msgs') return dir * ((a.msgs||0)-(b.msgs||0));
+    if (sk==='created') return dir * ((a.createdAt||0)-(b.createdAt||0));
+    return dir * ((a.lastUsedAt||0)-(b.lastUsedAt||0));
+  }});
+
+  const total = sessions.length;
+  const pageSize = state.archivePageSize;
+  const maxPage = Math.max(0, Math.ceil(total / pageSize) - 1);
+  state.archivePage = Math.min(state.archivePage, maxPage);
+  const page = sessions.slice(state.archivePage * pageSize, (state.archivePage + 1) * pageSize);
+
+  const dark = isDark();
+  const closedStatusLabels = {{}};
+  getClosedStatuses().forEach(s => closedStatusLabels[s.id] = s.label);
+
+  document.getElementById('archive-body').innerHTML = page.length ? page.map(s => {{
+    const wsBg = dark ? s.wsCd : s.wsCl;
+    return `<tr>
+      <td class="cn">${{esc((s.name||'').slice(0,60))}}</td>
+      <td><span class="ws-badge" style="background:${{wsBg}}">${{esc(s.wsName)}}</span></td>
+      <td><span class="sb sb-${{s.status}}">${{esc(closedStatusLabels[s.status]||s.status)}}</span></td>
+      <td class="cm">${{relTime(s.lastUsedAt)}}</td>
+      <td class="cm">${{fmtDate(s.createdAt)}}</td>
+      <td class="cm">${{fmtCost(s.cost)}}</td>
+      <td class="cm">${{s.msgs}}</td>
+      <td class="archive-actions">
+        ${{API ? `<button class="reopen-btn" data-sid="${{s.id}}" data-ws="${{s.wsId}}">Reopen</button>` : ''}}
+        <button class="open-btn" data-sid="${{s.id}}" data-sdksid="${{s.sdkSid}}" data-wsuuid="${{s.wsUuid}}" title="Open in Craft Agents">
+          <svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        </button>
+      </td></tr>`;
+  }}).join('') : '<tr><td colspan="8" style="text-align:center;padding:32px;color:var(--tx3)">No archived sessions</td></tr>';
+
+  document.getElementById('archive-page').innerHTML = total > pageSize ? `
+    <button ${{state.archivePage===0?'disabled':''}} id="arch-prev">&larr; Prev</button>
+    <span>Page ${{state.archivePage+1}} of ${{maxPage+1}} (${{total}} sessions)</span>
+    <button ${{state.archivePage>=maxPage?'disabled':''}} id="arch-next">Next &rarr;</button>
+  ` : total ? `<span>${{total}} session${{total!==1?'s':''}}</span>` : '';
+
+  // Update sort indicators
+  document.querySelectorAll('#archive-table th').forEach(th => {{
+    th.classList.toggle('sorted', th.dataset.key === state.archiveSort.key);
+    const a = th.querySelector('.arrow');
+    if (a) a.textContent = th.dataset.key === state.archiveSort.key ? (state.archiveSort.asc ? '\\u2191' : '\\u2193') : '\\u2191';
+  }});
+}}
+
+// Feature 4: Batch bar
+function renderBatchBar() {{
+  const bar = document.getElementById('batch-bar');
+  if (!state.selectMode || state.selected.size === 0) {{
+    bar.style.display = 'none';
+    return;
+  }}
+  bar.style.display = 'flex';
+  document.getElementById('batch-count').textContent = state.selected.size + ' selected';
+}}
+
+// Feature 3: Label picker
+function showLabelPicker(sid, wsId, anchorEl) {{
+  closeLabelPicker();
+  const sess = DATA.sessions.find(s => s.id === sid && s.wsId === wsId);
+  if (!sess) return;
+  const ws = getWsConfig(wsId);
+  const labelDefs = ws ? ws.labelDefs || [] : [];
+  if (!labelDefs.length) {{ toast('No labels configured for this workspace', 'error'); return; }}
+
+  const rawLabels = new Set((sess.rawLabels||[]).map(l => l.split('::')[0]));
+  const dark = isDark();
+
+  const picker = document.createElement('div');
+  picker.className = 'label-picker';
+  picker.innerHTML = labelDefs.map(lb => {{
+    const checked = rawLabels.has(lb.id);
+    const c = dark ? lb.cd : lb.cl;
+    return `<label class="label-picker-item" data-lid="${{lb.id}}">
+      <input type="checkbox" class="label-check" value="${{lb.id}}" ${{checked?'checked':''}}>
+      <span class="label-dot" style="background:${{c}}"></span>
+      <span>${{esc(lb.name)}}</span>
+    </label>`;
+  }}).join('');
+
+  // Position relative to anchor
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.position = 'fixed';
+  picker.style.top = (rect.bottom + 4) + 'px';
+  picker.style.left = Math.max(8, rect.left - 80) + 'px';
+
+  picker.addEventListener('change', async e => {{
+    const cb = e.target;
+    if (!cb.classList.contains('label-check')) return;
+    const lid = cb.value;
+    let labels = [...(sess.rawLabels||[])];
+    if (cb.checked) {{
+      if (!labels.some(l => l === lid || l.startsWith(lid + '::'))) labels.push(lid);
+    }} else {{
+      labels = labels.filter(l => l !== lid && !l.startsWith(lid + '::'));
+    }}
+    const ok = await updateLabels(sid, wsId, labels);
+    if (ok) {{
+      // Refresh the page to get updated label display data
+      location.reload();
+    }}
+  }});
+
+  document.body.appendChild(picker);
+  state.labelPicker = picker;
+}}
+
+function closeLabelPicker() {{
+  if (state.labelPicker) {{
+    state.labelPicker.remove();
+    state.labelPicker = null;
+  }}
+}}
+
+function renderViewToggle() {{
+  const boardView = document.getElementById('board-view');
+  const archiveView = document.getElementById('archive-view');
+  if (state.view === 'archive') {{
+    boardView.style.display = 'none';
+    archiveView.className = 'archive-view active';
+    renderArchive();
+  }} else {{
+    boardView.style.display = '';
+    archiveView.className = 'archive-view';
+  }}
+}}
+
 function applyTheme() {{
   const r = document.documentElement.style;
   const dark = isDark();
@@ -908,7 +1404,6 @@ function applyTheme() {{
       return;
     }}
   }}
-  // Reset to CSS defaults
   VARS.forEach(v => r.removeProperty(v));
 }}
 
@@ -919,6 +1414,8 @@ function renderAll() {{
   renderFilters();
   renderBoard();
   renderClosed();
+  renderViewToggle();
+  renderBatchBar();
 }}
 
 // ─── Drag & Drop ─────────────────────────────────────
@@ -969,11 +1466,15 @@ document.getElementById('ws-select').addEventListener('change', e => {{
   state.selectedWs = e.target.value;
   state.expanded = null;
   state.search = '';
+  state.selected.clear();
   document.getElementById('search').value = '';
   renderAll();
 }});
 
 document.getElementById('filters').addEventListener('click', e => {{
+  // New session button in filter pills
+  const newBtn = e.target.closest('[data-newws]');
+  if (newBtn) {{ newSession(newBtn.dataset.newws); return; }}
   const pill = e.target.closest('.fpill');
   if (!pill) return;
   const ws = pill.dataset.ws;
@@ -995,19 +1496,96 @@ document.getElementById('sort').addEventListener('change', e => {{
   renderBoard();
 }});
 
+// Feature 1: Export
+document.getElementById('export-btn').addEventListener('click', exportCSV);
+
+// Feature 4: Select mode toggle
+document.getElementById('select-toggle').addEventListener('click', () => {{
+  state.selectMode = !state.selectMode;
+  state.selected.clear();
+  document.querySelector('.wrap').classList.toggle('select-mode', state.selectMode);
+  renderBoard();
+  renderBatchBar();
+}});
+
+// Board click handler — cards, open buttons, label buttons, checkboxes
 document.getElementById('board').addEventListener('click', e => {{
-  // Handle open button click
+  // New session button in column header
+  const colNewBtn = e.target.closest('.col-new-btn');
+  if (colNewBtn) {{ e.stopPropagation(); newSession(colNewBtn.dataset.newws); return; }}
+
+  // Checkbox in select mode
+  const cb = e.target.closest('.card-check');
+  if (cb) {{
+    e.stopPropagation();
+    const card = cb.closest('.card');
+    const key = card.dataset.ws + ':' + card.dataset.id;
+    if (cb.checked) state.selected.add(key);
+    else state.selected.delete(key);
+    card.classList.toggle('selected', cb.checked);
+    renderBatchBar();
+    return;
+  }}
+
+  // Label button
+  const labelBtn = e.target.closest('.label-btn');
+  if (labelBtn) {{
+    e.stopPropagation();
+    showLabelPicker(labelBtn.dataset.sid, labelBtn.dataset.ws, labelBtn);
+    return;
+  }}
+
+  // Open button
   const openBtn = e.target.closest('.open-btn');
   if (openBtn) {{
     e.stopPropagation();
     openSession(openBtn);
     return;
   }}
-  // Handle card expansion
+
+  // Card expansion (not in select mode)
   const card = e.target.closest('.card');
   if (!card) return;
+  if (state.selectMode) {{
+    // Toggle selection on card click in select mode
+    const key = card.dataset.ws + ':' + card.dataset.id;
+    if (state.selected.has(key)) state.selected.delete(key);
+    else state.selected.add(key);
+    renderBoard();
+    renderBatchBar();
+    return;
+  }}
   state.expanded = state.expanded === card.dataset.id ? null : card.dataset.id;
   renderBoard();
+}});
+
+// Close label picker on outside click
+document.addEventListener('click', e => {{
+  if (state.labelPicker && !state.labelPicker.contains(e.target) && !e.target.closest('.label-btn')) {{
+    closeLabelPicker();
+  }}
+}});
+
+// Feature 4: Batch actions
+document.getElementById('batch-apply-status').addEventListener('click', () => {{
+  const newStatus = document.getElementById('batch-status-select').value;
+  if (newStatus) batchUpdateStatus(newStatus);
+}});
+document.getElementById('batch-deselect').addEventListener('click', () => {{
+  state.selected.clear();
+  state.selectMode = false;
+  document.querySelector('.wrap').classList.remove('select-mode');
+  renderBoard();
+  renderBatchBar();
+}});
+
+// Populate batch status dropdown
+const batchSelect = document.getElementById('batch-status-select');
+getAllStatuses().forEach(s => {{
+  const opt = document.createElement('option');
+  opt.value = s.id;
+  opt.textContent = s.label;
+  batchSelect.appendChild(opt);
 }});
 
 document.getElementById('closed-toggle').addEventListener('click', () => {{
@@ -1022,11 +1600,76 @@ document.querySelector('.ct thead').addEventListener('click', e => {{
   renderClosed();
 }});
 
+// Feature 5: View tabs
+document.getElementById('view-tabs').addEventListener('click', e => {{
+  const tab = e.target.closest('.view-tab');
+  if (!tab) return;
+  state.view = tab.dataset.view;
+  document.querySelectorAll('.view-tab').forEach(t => t.classList.toggle('active', t.dataset.view === state.view));
+  renderViewToggle();
+}});
+
+// Feature 5: Archive filters & sorting
+['archive-status','archive-ws','archive-date'].forEach(id => {{
+  document.getElementById(id).addEventListener('change', () => {{ state.archivePage = 0; renderArchive(); }});
+}});
+document.getElementById('archive-search').addEventListener('input', () => {{ state.archivePage = 0; renderArchive(); }});
+
+document.querySelector('#archive-table thead').addEventListener('click', e => {{
+  const th = e.target.closest('th');
+  if (!th?.dataset.key) return;
+  if (state.archiveSort.key === th.dataset.key) state.archiveSort.asc = !state.archiveSort.asc;
+  else {{ state.archiveSort.key = th.dataset.key; state.archiveSort.asc = th.dataset.key==='name'||th.dataset.key==='ws'; }}
+  renderArchive();
+}});
+
+// Feature 5: Archive pagination and actions
+document.getElementById('archive-page').addEventListener('click', e => {{
+  if (e.target.id === 'arch-prev') {{ state.archivePage--; renderArchive(); }}
+  if (e.target.id === 'arch-next') {{ state.archivePage++; renderArchive(); }}
+}});
+
+document.getElementById('archive-view').addEventListener('click', async e => {{
+  const reopenBtn = e.target.closest('.reopen-btn');
+  if (reopenBtn) {{
+    await updateStatus(reopenBtn.dataset.sid, reopenBtn.dataset.ws, 'todo');
+    renderArchive();
+    return;
+  }}
+  const openBtn = e.target.closest('.open-btn');
+  if (openBtn) {{ openSession(openBtn); return; }}
+}});
+
+// Populate archive filter dropdowns
+const archStatusSel = document.getElementById('archive-status');
+getClosedStatuses().forEach(s => {{
+  const opt = document.createElement('option');
+  opt.value = s.id;
+  opt.textContent = s.label;
+  archStatusSel.appendChild(opt);
+}});
+const archWsSel = document.getElementById('archive-ws');
+DATA.workspaces.forEach(ws => {{
+  const opt = document.createElement('option');
+  opt.value = ws.id;
+  opt.textContent = ws.name;
+  archWsSel.appendChild(opt);
+}});
+
 matchMedia('(prefers-color-scheme:dark)').addEventListener('change', renderAll);
 
 document.addEventListener('keydown', e => {{
   if ((e.metaKey||e.ctrlKey) && e.key==='k') {{ e.preventDefault(); document.getElementById('search').focus(); }}
   if (e.key==='Escape') {{
+    closeLabelPicker();
+    if (state.selectMode) {{
+      state.selectMode = false;
+      state.selected.clear();
+      document.querySelector('.wrap').classList.remove('select-mode');
+      renderBoard();
+      renderBatchBar();
+      return;
+    }}
     document.getElementById('search').blur();
     state.search = '';
     document.getElementById('search').value = '';
@@ -1036,7 +1679,6 @@ document.addEventListener('keydown', e => {{
 }});
 
 // ─── Init ────────────────────────────────────────────
-// Auto-select workspace from URL parameter ?ws=slug
 const urlWs = new URLSearchParams(location.search).get('ws');
 if (urlWs && DATA.workspaces.some(w => w.id === urlWs)) {{
   state.selectedWs = urlWs;
@@ -1098,8 +1740,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/data":
             self._refresh_data()
             self._json(200, Handler.data)
+        elif path == "/api/alerts":
+            self._json(200, {"ok": True, "alerts": get_alerts()})
+        elif path == "/api/workspace-labels":
+            qs = parse_qs(urlparse(self.path).query)
+            ws_dir = qs.get("ws", [""])[0]
+            if not ws_dir:
+                self._json(400, {"ok": False, "error": "Missing ws param"})
+            else:
+                self._json(200, {"ok": True, "labels": get_workspace_labels(ws_dir)})
         elif path == "/health":
-            self._json(200, {"ok": True, "pid": os.getpid()})
+            self._json(200, {"ok": True, "pid": os.getpid(), "version": __version__})
         else:
             self.send_error(404)
 
@@ -1118,6 +1769,49 @@ class Handler(BaseHTTPRequestHandler):
             if ok:
                 self._refresh_data()
             self._json(200 if ok else 400, {"ok": ok, "message": msg} if ok else {"ok": False, "error": msg})
+        elif path == "/api/labels":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            sid = body.get("sessionId")
+            ws = body.get("wsDir")
+            labels = body.get("labels")
+            if not all([sid, ws]) or labels is None:
+                self._json(400, {"ok": False, "error": "Missing fields"})
+                return
+            ok, result = update_session_labels(ws, sid, labels)
+            if ok:
+                self._refresh_data()
+            self._json(200 if ok else 400, {"ok": ok, "labels": result} if ok else {"ok": False, "error": result})
+        elif path == "/api/batch/status":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            items = body.get("items", [])
+            new_status = body.get("newStatus")
+            if not items or not new_status:
+                self._json(400, {"ok": False, "error": "Missing fields"})
+                return
+            updated, failed = 0, 0
+            for item in items:
+                ok, _ = update_session_status(item["wsDir"], item["sessionId"], new_status)
+                if ok:
+                    updated += 1
+                else:
+                    failed += 1
+            self._refresh_data()
+            self._json(200, {"ok": True, "updated": updated, "failed": failed})
+        elif path == "/api/open-url":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            url = body.get("url", "")
+            if not url.startswith("craftagents://"):
+                self._json(400, {"ok": False, "error": "Only craftagents:// URLs allowed"})
+                return
+            try:
+                result = subprocess.run(["open", url], capture_output=True, timeout=5)
+                self._json(200 if result.returncode == 0 else 500,
+                    {"ok": result.returncode == 0, "url": url})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
         elif path == "/api/open":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
@@ -1127,8 +1821,6 @@ class Handler(BaseHTTPRequestHandler):
             if not session_id:
                 self._json(400, {"ok": False, "error": "Missing sessionId"})
                 return
-            # Use OS-level deeplink via macOS open command (bypasses browser context)
-            # Workspace-targeted to avoid "focused window" routing to the browser overlay
             if ws_uuid:
                 url = f"craftagents://workspace/{ws_uuid}/allSessions/session/{session_id}"
             else:
@@ -1138,7 +1830,6 @@ class Handler(BaseHTTPRequestHandler):
                 if result.returncode == 0:
                     self._json(200, {"ok": True, "method": "deeplink", "url": url})
                 else:
-                    # Fallback: try with SDK UUID format
                     if sdk_sid:
                         fb_url = f"craftagents://allSessions/session/{sdk_sid}"
                         result2 = subprocess.run(["open", fb_url], capture_output=True, timeout=5)

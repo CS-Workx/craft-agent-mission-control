@@ -1,6 +1,6 @@
 ---
 name: "Mission Control"
-description: "Interactive cross-workspace dashboard with kanban board, drag-and-drop status management, search, and filters"
+description: "Interactive cross-workspace dashboard with kanban board, drag-and-drop, batch operations, label management, CSV export, and archive view"
 alwaysAllow: ["Bash"]
 ---
 
@@ -57,5 +57,10 @@ Then display inline:
 - **Sort** — by last activity, name, cost, messages, or staleness
 - **Workspace filters** — toggle workspace visibility in overview mode
 - **Expandable cards** — click to see full details (ID, tokens, cost, model, created date)
-- **Closed sessions** — collapsible section in overview mode with sortable table
 - **Responsive** — adapts to window width, fixed-width kanban columns
+- **CSV export** — download visible/filtered sessions as a CSV file
+- **New session** — create sessions directly from the dashboard via Craft Agents deeplinks (`craftagents://workspace/{id}/action/new-chat`)
+- **Label management** — add/remove labels on sessions via a label picker on each card
+- **Batch operations** — multi-select cards and change status in bulk via a floating action bar
+- **Archive view** — dedicated view for closed sessions with filters (status, workspace, date range), sorting, pagination, and reopen action
+- **Stale alerts API** — `GET /api/alerts` returns sessions stale 7+ days for use with scheduled automations
