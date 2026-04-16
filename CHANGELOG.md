@@ -4,7 +4,11 @@ All notable changes to Mission Control will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [2.0.0] — 2026-04-13
+## [Unreleased]
+
+_Nothing yet — see [ROADMAP.md](ROADMAP.md) for what's coming._
+
+## [2.0.0] — 2026-04-16
 
 ### Added
 
@@ -23,6 +27,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Workspace filter pills in overview mode now include a "+" button for creating new sessions per workspace
 - View toggle tabs (Board/Archive) replace the old closed sessions collapsible section as the primary way to access archived sessions
 - Board view hides closed sessions section when Archive view is available
+
+### Docs & Project
+
+- **INSTALL.md** — dedicated installation guide with three clearly labeled paths: human manual, human one-liner, and agent-driven. Explains what `~/.agents/` is and why NOT to install into a Craft Agents workspace folder.
+- **install.sh / uninstall.sh** — idempotent installer and symmetric uninstaller. Handle Launch Agent setup, plist `$HOME` substitution, health check verification, and `--yes` / `--dry-run` flags for non-interactive use by AI agents.
+- **ROADMAP.md** — public roadmap with near-term, mid-term, and long-term items, plus an explicit "won't do" list.
+- **CONTRIBUTING.md** — contribution guidelines with the zero-dependencies rule, commit conventions, and testing checklist.
+- **SECURITY.md** — threat model (local-only, no auth, single-user machine) and private-advisory reporting channel.
+- **README.md** — restructured with installation-first flow, status badges, a "What this is" box clarifying the `~/.agents/skills/` convention, and an Author & Credits section.
+- **GitHub templates** — bug report, feature request, and pull request templates.
+- **CI** — GitHub Actions workflow: Python syntax check across 3.9–3.12, plist XML validation, shellcheck on installers, and a guard against hardcoded personal paths.
+- **`.gitignore`** — expanded with defensive patterns for env files, secrets, logs, and local-only artifacts.
+- **Plist** — replaced hardcoded `/Users/<personal-username>/…` path with a `/Users/YOUR_USERNAME/…` placeholder that the installer substitutes at install time.
+- **LICENSE** — updated copyright attribution to `Steff Vanhaverbeke (CS Workx)`.
 
 ## [1.0.0] — 2026-04-12
 
@@ -50,5 +68,6 @@ Initial public release.
 - Toast notifications for success/error feedback
 - Craft Agents skill definition (SKILL.md) for invocation from any workspace
 
+[Unreleased]: https://github.com/CS-Workx/craft-agent-mission-control/compare/v2.0.0...HEAD
 [2.0.0]: https://github.com/CS-Workx/craft-agent-mission-control/releases/tag/v2.0.0
 [1.0.0]: https://github.com/CS-Workx/craft-agent-mission-control/releases/tag/v1.0.0

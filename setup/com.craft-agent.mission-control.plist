@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/steffvanhaverbeke/.agents/skills/mission-control/dashboard.py</string>
+        <string>/Users/YOUR_USERNAME/.agents/skills/mission-control/dashboard.py</string>
         <string>--serve</string>
         <string>9753</string>
     </array>

@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.egg-info/
+.pytest_cache/
 
 # macOS
 .DS_Store
@@ -15,3 +17,25 @@ __pycache__/
 *~
 .idea/
 .vscode/
+
+# Secrets & env — never commit any of these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets.json
+credentials.json
+auth.json
+
+# Local runtime & logs
+/tmp/
+*.log
+mission-control-*.csv
+dashboard-local.html
+dashboard.html
+
+# User-specific / local-only artifacts
+*.local
+.local/

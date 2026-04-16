@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Syntax check
+        run: python -m py_compile dashboard.py
+
+  plist:
+    name: Validate plist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Parse and validate plist
+        run: |
+          python - <<'PY'
+          import plistlib, sys
+          with open('setup/com.craft-agent.mission-control.plist', 'rb') as f:
+              data = plistlib.load(f)
+          assert data.get('Label') == 'com.craft-agent.mission-control', 'Label missing or wrong'
+          assert isinstance(data.get('ProgramArguments'), list), 'ProgramArguments must be a list'
+          assert data.get('RunAtLoad') is True, 'RunAtLoad must be true'
+          print('plist valid')
+          PY
+
+  shell:
+    name: Shellcheck installers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          shellcheck install.sh uninstall.sh
+
+  no-hardcoded-paths:
+    name: No hardcoded personal paths
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Search
+        run: |
+          set +e
+          matches=$(grep -rn -E "/Users/[a-z][a-z0-9]+/" \
+            --include="*.sh" --include="*.plist" --include="*.py" --include="*.md" \
+            --exclude-dir=.git . \
+            | grep -v "/Users/YOUR_USERNAME/")
+          if [ -n "$matches" ]; then
+            echo "Found hardcoded user paths:"
+            echo "$matches"
+            exit 1
+          fi
+          echo "no hardcoded personal paths"

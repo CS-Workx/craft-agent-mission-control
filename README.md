@@ -1,8 +1,46 @@
 # Mission Control
 
-Cross-workspace session dashboard for [Craft Agents](https://craft.do) — a self-contained kanban board that gives you a bird's-eye view of every session across all your workspaces. Search, filter, sort, drag-and-drop status changes, workspace theming, and deeplink navigation, all from a single browser tab. Zero dependencies, pure Python 3 stdlib.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Platform: macOS / Linux / Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)]()
+[![CI](https://github.com/CS-Workx/craft-agent-mission-control/actions/workflows/ci.yml/badge.svg)](https://github.com/CS-Workx/craft-agent-mission-control/actions)
+
+Cross-workspace session dashboard for [Craft Agents](https://craft.do) — a self-contained kanban board that gives you a bird's-eye view of every session across all your workspaces. Search, filter, sort, drag-and-drop status changes, label management, batch operations, archive view, workspace theming, and deeplink navigation, all from a single browser tab. Zero runtime dependencies — Python 3 stdlib only.
 
 Part of the [Superworker Toolbox](https://github.com/CoachSteff).
+
+> ## 📦 What this is
+> Mission Control is a **generic agent skill**, not a Craft Agents plugin. It installs to `~/.agents/skills/mission-control/` — the cross-tool skill folder that Claude Code, Craft Agents, and other skill-aware AI agents all read from. **Do not install it into a Craft Agents workspace folder** (`~/.craft-agent/workspaces/<ws>/skills/`) — that would tie the dashboard to a single workspace instead of spanning all of them.
+
+## Quick Install
+
+### Manual (recommended — you see every command)
+
+```bash
+git clone https://github.com/CS-Workx/craft-agent-mission-control.git
+cd craft-agent-mission-control
+bash install.sh
+```
+
+### One-liner (for the trusting)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CS-Workx/craft-agent-mission-control/main/install.sh | bash
+```
+
+### For AI agents (deterministic, self-verifying)
+
+```bash
+set -e
+TMP=$(mktemp -d)
+git clone --depth 1 https://github.com/CS-Workx/craft-agent-mission-control.git "$TMP"
+bash "$TMP/install.sh" --yes
+curl -fsS http://localhost:9753/health
+```
+
+Success looks like `{"ok": true, "pid": <number>, "version": "2.0.0"}`.
+
+👉 **Full installation guide, prerequisites, and troubleshooting: [INSTALL.md](INSTALL.md)**
 
 ## Features
 
@@ -14,46 +52,21 @@ Part of the [Superworker Toolbox](https://github.com/CoachSteff).
 - **Sort** — by last activity, name, cost, messages, or staleness
 - **Workspace filter pills** — toggle workspace visibility in overview mode
 - **Expandable cards** — click to see full details (session ID, created date, tokens, cost, messages, model)
-- **Closed sessions** — collapsible table in overview mode with sortable columns
+- **CSV export** — download visible/filtered sessions as a CSV file
+- **New session button** — create sessions directly from the dashboard via Craft Agents deeplinks
+- **Label management** — tag icon on each card opens a label picker dropdown
+- **Batch operations** — multi-select cards and change status in bulk via a floating action bar
+- **Archive view** — dedicated view for closed sessions with filters, sorting, pagination, and reopen action
+- **Stale alerts API** — `GET /api/alerts` returns sessions stale 7+ days for use with scheduled automations
 - **Workspace theming** — loads theme colors from Craft Agents workspace config
 - **Light/dark mode** — responds to system `prefers-color-scheme`
 - **Stats header** — total visible, open, active 24h, stale 7d+, total cost, workspace count
 - **Auto-start** — macOS Launch Agent starts the server on login and restarts on crash
-- **Health endpoint** — `GET /health` for monitoring
 - **Zero dependencies** — Python 3 stdlib only, nothing to install
 
-## Installation
-
-### 1. Copy skill files
-
-Place the skill files where Craft Agents can find them:
-
-```bash
-mkdir -p ~/.agents/skills/mission-control
-cp dashboard.py SKILL.md icon.svg ~/.agents/skills/mission-control/
-```
-
-### 2. Set up auto-start (macOS)
-
-Copy the Launch Agent plist and load it. Edit the path inside the plist first if your home directory differs:
-
-```bash
-cp setup/com.craft-agent.mission-control.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.craft-agent.mission-control.plist
-```
-
-The server starts automatically on login at `http://localhost:9753`.
-
-### 3. Verify
-
-```bash
-curl http://localhost:9753/health
-# {"ok": true, "pid": 12345}
-```
-
-Open [http://localhost:9753](http://localhost:9753) in your browser.
-
 ## Usage
+
+Once installed, open the dashboard at [http://localhost:9753](http://localhost:9753).
 
 ### Server mode (interactive)
 
@@ -61,7 +74,7 @@ Open [http://localhost:9753](http://localhost:9753) in your browser.
 python3 dashboard.py --serve 9753
 ```
 
-This is the default mode when running via the Launch Agent. Enables drag-and-drop status changes and session deeplinks.
+Enables drag-and-drop status changes, label editing, batch operations, and session deeplinks.
 
 ### Static mode (view-only snapshot)
 
@@ -86,9 +99,14 @@ From any Craft Agents session, invoke the `[skill:mission-control]` skill. It op
 |--------|------|---------|
 | GET | `/` | Serves the dashboard (re-collects data on every load) |
 | GET | `/api/data` | Returns collected data as JSON |
-| GET | `/health` | Health check (`{"ok": true, "pid": N}`) |
-| POST | `/api/status` | Update session status — `{"sessionId", "wsDir", "newStatus"}` |
-| POST | `/api/open` | Open session in Craft Agents — `{"sessionId", "sdkSessionId", "wsUuid"}` |
+| GET | `/health` | Health check (`{"ok": true, "pid": N, "version": "2.0.0"}`) |
+| GET | `/api/alerts` | Stale session alerts (sessions inactive 7+ days) |
+| GET | `/api/workspace-labels` | Label config for a workspace |
+| POST | `/api/status` | Update session status |
+| POST | `/api/batch/status` | Bulk status change |
+| POST | `/api/labels` | Update session labels |
+| POST | `/api/open` | Open session in Craft Agents |
+| POST | `/api/open-url` | Open any `craftagents://` deeplink |
 
 ## Architecture
 
@@ -108,7 +126,7 @@ dashboard.py --serve 9753
   └── HTTP Server       Serves HTML, JSON API, status updates, session open
 ```
 
-The entire dashboard is a single self-contained HTML page. Data is embedded as a JSON blob. No external CDN, no build step, no node_modules.
+The entire dashboard is a single self-contained HTML page. Data is embedded as a JSON blob. No external CDN, no build step, no `node_modules`.
 
 ## Management
 
@@ -118,7 +136,7 @@ launchctl unload ~/Library/LaunchAgents/com.craft-agent.mission-control.plist
 launchctl load ~/Library/LaunchAgents/com.craft-agent.mission-control.plist
 
 # View logs
-cat /tmp/mission-control.log
+tail -n 50 /tmp/mission-control.log
 
 # Health check
 curl http://localhost:9753/health
@@ -126,12 +144,26 @@ curl http://localhost:9753/health
 
 ## Known Limitations
 
-1. **Status changes via drag-and-drop** modify `session.jsonl` directly. This does not trigger Craft Agents automations (e.g., `SessionStatusChange` events) — automations only fire when status changes go through the app's internal API.
+1. **Status changes via drag-and-drop** modify `session.jsonl` directly. This does not trigger Craft Agents automations (e.g., `SessionStatusChange` events) — automations only fire when status changes go through the app's internal API. See [ROADMAP](ROADMAP.md) for the planned fix.
 
-2. **macOS only** for auto-start and deeplinks. The dashboard itself is cross-platform Python, but the Launch Agent and `open` command for deeplinks are macOS-specific.
+2. **macOS only** for auto-start and deeplinks. The dashboard itself is cross-platform Python; the Launch Agent and `open` command for deeplinks are macOS-specific. Install with `--no-launchd` on Linux/Windows.
 
 3. **Deeplink session navigation** requires the correct workspace UUID from `~/.craft-agent/config.json` (top-level). The workspace's own config uses a different ID format that won't work for deeplinks.
 
+## Documentation
+
+- **[INSTALL.md](INSTALL.md)** — full installation guide (humans + AI agents)
+- **[SECURITY.md](SECURITY.md)** — threat model and how to report vulnerabilities
+- **[ROADMAP.md](ROADMAP.md)** — what's coming next
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — how to contribute
+- **[CHANGELOG.md](CHANGELOG.md)** — release history
+
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — free for personal and commercial use.
+
+## Author & Credits
+
+Built by **[Steff Vanhaverbeke](https://github.com/CoachSteff)** — AI adoption expert, trainer, coach, and founder of [CS Workx](https://github.com/CS-Workx). Mission Control is part of the [Superworker Toolbox](https://github.com/CoachSteff), a collection of open-source tools designed to help people and teams thrive in an AI-driven world.
+
+If Mission Control saves you time, a GitHub ⭐️ is a nice way to say thanks.
