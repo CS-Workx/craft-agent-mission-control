@@ -9,12 +9,14 @@ Usage:
 Server mode enables drag-and-drop status changes via a local API.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 from pathlib import Path
@@ -27,6 +29,9 @@ from urllib.parse import urlparse, parse_qs
 NOW_MS = int(time.time() * 1000)
 CRAFT_DIR = Path(os.path.expanduser("~/.craft-agent"))
 WORKSPACES_DIR = CRAFT_DIR / "workspaces"
+
+SESSION_ID_RE = re.compile(r"^\d{6}-[a-z]+-[a-z]+$")
+WS_DIR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 WS_COLORS = [
     ("#8b5cf6", "#a78bfa"), ("#3b82f6", "#60a5fa"), ("#10b981", "#34d399"),
@@ -265,9 +270,57 @@ def build_data(workspaces):
 
 # ─── Status Update ──────────────────────────────────────────────────────────
 
+def _safe_session_path(ws_dir_name, session_id):
+    """Validate inputs and resolve to a session.jsonl path inside WORKSPACES_DIR.
+
+    Returns the resolved Path on success, or None on any validation failure.
+    """
+    if not ws_dir_name or not WS_DIR_RE.match(ws_dir_name):
+        return None
+    if not session_id or not SESSION_ID_RE.match(session_id):
+        return None
+    try:
+        target = (WORKSPACES_DIR / ws_dir_name / "sessions" / session_id / "session.jsonl").resolve()
+        target.relative_to(WORKSPACES_DIR.resolve())
+    except (ValueError, OSError):
+        return None
+    return target
+
+
+def _safe_workspace_dir(ws_dir_name):
+    """Validate workspace slug and resolve to a workspace directory inside WORKSPACES_DIR."""
+    if not ws_dir_name or not WS_DIR_RE.match(ws_dir_name):
+        return None
+    try:
+        target = (WORKSPACES_DIR / ws_dir_name).resolve()
+        target.relative_to(WORKSPACES_DIR.resolve())
+    except (ValueError, OSError):
+        return None
+    return target
+
+
+def _atomic_write_lines(path, lines):
+    """Write lines to path atomically via tmp file + os.replace()."""
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".sess-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            f.writelines(lines)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def update_session_status(ws_dir_name, session_id, new_status):
     """Update sessionStatus in the first line of session.jsonl."""
-    jsonl = WORKSPACES_DIR / ws_dir_name / "sessions" / session_id / "session.jsonl"
+    jsonl = _safe_session_path(ws_dir_name, session_id)
+    if jsonl is None:
+        return False, "Invalid workspace or session id"
     if not jsonl.exists():
         return False, "Session not found"
     try:
@@ -279,8 +332,7 @@ def update_session_status(ws_dir_name, session_id, new_status):
         old_status = meta.get("sessionStatus", "todo")
         meta["sessionStatus"] = new_status
         lines[0] = json.dumps(meta, separators=(",", ":")) + "\n"
-        with open(jsonl, "w") as f:
-            f.writelines(lines)
+        _atomic_write_lines(jsonl, lines)
         return True, f"{old_status} -> {new_status}"
     except Exception as e:
         return False, str(e)
@@ -288,7 +340,9 @@ def update_session_status(ws_dir_name, session_id, new_status):
 
 def update_session_labels(ws_dir_name, session_id, labels):
     """Update labels in the first line of session.jsonl."""
-    jsonl = WORKSPACES_DIR / ws_dir_name / "sessions" / session_id / "session.jsonl"
+    jsonl = _safe_session_path(ws_dir_name, session_id)
+    if jsonl is None:
+        return False, "Invalid workspace or session id"
     if not jsonl.exists():
         return False, "Session not found"
     try:
@@ -299,8 +353,7 @@ def update_session_labels(ws_dir_name, session_id, labels):
         meta = json.loads(lines[0])
         meta["labels"] = labels
         lines[0] = json.dumps(meta, separators=(",", ":")) + "\n"
-        with open(jsonl, "w") as f:
-            f.writelines(lines)
+        _atomic_write_lines(jsonl, lines)
         return True, labels
     except Exception as e:
         return False, str(e)
@@ -308,7 +361,10 @@ def update_session_labels(ws_dir_name, session_id, labels):
 
 def get_workspace_labels(ws_dir_name):
     """Return the full label tree for a workspace."""
-    lb_path = WORKSPACES_DIR / ws_dir_name / "labels" / "config.json"
+    ws_dir = _safe_workspace_dir(ws_dir_name)
+    if ws_dir is None:
+        return []
+    lb_path = ws_dir / "labels" / "config.json"
     if not lb_path.exists():
         return []
     try:
@@ -649,8 +705,8 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
       </div>
       <select class="select" id="sort">
         <option value="activity">Sort: Last Activity</option>
-        <option value="name">Sort: Name (A\\u2013Z)</option>
-        <option value="cost">Sort: Cost (High\\u2013Low)</option>
+        <option value="name">Sort: Name (A\u2013Z)</option>
+        <option value="cost">Sort: Cost (High\u2013Low)</option>
         <option value="messages">Sort: Messages</option>
         <option value="staleness">Sort: Most Stale</option>
       </select>
@@ -793,6 +849,22 @@ function isManageMode() {{ return state.selectedWs !== 'all'; }}
 
 function getWsConfig(wsId) {{ return DATA.workspaces.find(w => w.id === wsId); }}
 
+function deriveLabels(rawLabels, wsConfig) {{
+  const defs = Object.fromEntries(((wsConfig && wsConfig.labelDefs) || []).map(l => [l.id, l]));
+  return (rawLabels || []).flatMap(lb => {{
+    const idx = lb.indexOf('::');
+    const id = idx === -1 ? lb : lb.slice(0, idx);
+    const override = idx === -1 ? '' : lb.slice(idx + 2);
+    if (id === 'url') return [];
+    const def = defs[id] || {{}};
+    return [{{
+      d: (override || def.name || id).slice(0, 20),
+      cl: def.cl || '#888',
+      cd: def.cd || '#aaa',
+    }}];
+  }});
+}}
+
 function cardKey(s) {{ return s.wsId + ':' + s.id; }}
 
 function getStatusColumns() {{
@@ -926,7 +998,10 @@ async function updateLabels(sessionId, wsId, labels) {{
     const data = await res.json();
     if (data.ok) {{
       const sess = DATA.sessions.find(s => s.id === sessionId && s.wsId === wsId);
-      if (sess) sess.rawLabels = data.labels;
+      if (sess) {{
+        sess.rawLabels = data.labels;
+        sess.labels = deriveLabels(sess.rawLabels, getWsConfig(sess.wsId));
+      }}
       toast('Labels updated');
       return true;
     }} else {{
@@ -1349,8 +1424,7 @@ function showLabelPicker(sid, wsId, anchorEl) {{
     }}
     const ok = await updateLabels(sid, wsId, labels);
     if (ok) {{
-      // Refresh the page to get updated label display data
-      location.reload();
+      renderAll();
     }}
   }});
 
@@ -1704,10 +1778,17 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)
+
+    def _same_origin(self):
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        port = self.server.server_address[1]
+        allowed = (f"http://localhost:{port}", f"http://127.0.0.1:{port}")
+        return origin in allowed
 
     def _html(self, code, html):
         body = html.encode()
@@ -1719,9 +1800,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
     def _refresh_data(self):
@@ -1755,6 +1833,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._same_origin():
+            self._json(403, {"ok": False, "error": "Forbidden"})
+            return
         path = self.path.split("?")[0]
         if path == "/api/status":
             length = int(self.headers.get("Content-Length", 0))
@@ -1864,6 +1945,12 @@ def serve(port=9753):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-V", "--version"):
+        print(f"mission-control {__version__}")
+        sys.exit(0)
     if len(sys.argv) >= 2 and sys.argv[1] == "--serve":
         port = int(sys.argv[2]) if len(sys.argv) > 2 else 9753
         serve(port)

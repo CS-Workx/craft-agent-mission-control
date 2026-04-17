@@ -9,6 +9,8 @@ Mission Control is designed for **single-user local machines**. The default conf
 - The server has **no user accounts, no passwords, no tokens** — anyone who can reach `127.0.0.1:9753` on your machine can see and modify your sessions.
 - Session contents may include sensitive information (code, API keys, private chats). Treat the machine running Mission Control as you would treat any environment that has access to that data.
 
+**v2.0.1 closed a CSRF vector** where the previous `Access-Control-Allow-Origin: *` header combined with no auth meant any website the user visited could mutate session files through the running server. Mutating `POST` endpoints now reject cross-origin requests, and workspace / session identifiers in request bodies are validated against strict patterns with a resolved-path check to prevent traversal into paths outside `~/.craft-agent/workspaces/`. If you are still running v2.0.0, upgrade.
+
 ### What this means in practice
 
 | Situation | Is it safe? |

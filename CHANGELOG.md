@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 _Nothing yet — see [ROADMAP.md](ROADMAP.md) for what's coming._
 
+## [2.0.1] — 2026-04-17
+
+### Security
+
+- **Closed CSRF vector.** Removed `Access-Control-Allow-Origin: *` from API responses and preflight. Mutating `POST` endpoints (`/api/status`, `/api/labels`, `/api/batch/status`, `/api/open-url`, `/api/open`) now reject cross-origin requests with `403 Forbidden`. Any browser tab could previously issue state-changing requests while the dashboard was running.
+- **Path-traversal hardening on session writes.** Workspace and session identifiers coming in via `POST` bodies are now validated against strict patterns (`^\d{6}-[a-z]+-[a-z]+$` for session IDs; `^[A-Za-z0-9_-]+$` for workspace slugs) and resolved paths are confirmed to stay inside `~/.craft-agent/workspaces/` before any write. Defense in depth against symlink escape and crafted inputs.
+- **Atomic writes to `session.jsonl`.** `update_session_status` and `update_session_labels` now write via `tempfile.mkstemp` + `os.replace()`. A process kill or crash mid-write can no longer leave a truncated session file.
+
+### Fixed
+
+- Sort dropdown options rendered as literal `Sort: Name (A\u2013Z)` / `Sort: Cost (High\u2013Low)`. Now render as `Sort: Name (A–Z)` / `Sort: Cost (High–Low)` as intended.
+- Toggling a label in the label picker no longer forces a full `location.reload()`. Label pills update in place, preserving scroll position, expanded cards, selection, and search state.
+- `python3 dashboard.py --help` and `--version` no longer try to write HTML to a file named `--help`. They now print usage/version and exit cleanly. `-h` / `-V` short forms are also accepted.
+
 ## [2.0.0] — 2026-04-16
 
 ### Added
@@ -68,6 +82,7 @@ Initial public release.
 - Toast notifications for success/error feedback
 - Craft Agents skill definition (SKILL.md) for invocation from any workspace
 
-[Unreleased]: https://github.com/CS-Workx/craft-agent-mission-control/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/CS-Workx/craft-agent-mission-control/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/CS-Workx/craft-agent-mission-control/releases/tag/v2.0.1
 [2.0.0]: https://github.com/CS-Workx/craft-agent-mission-control/releases/tag/v2.0.0
 [1.0.0]: https://github.com/CS-Workx/craft-agent-mission-control/releases/tag/v1.0.0
