@@ -9,7 +9,7 @@ Usage:
 Server mode enables drag-and-drop status changes via a local API.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 import json
 import logging
@@ -567,6 +567,19 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
 .card.expanded .card-details{{display:block}}
 .detail-row{{display:flex;justify-content:space-between;padding:3px 0}}
 .detail-label{{color:var(--tx3);font-weight:500}}
+
+/* ─── FLIP animations ────────────────────────────────── */
+.card{{will-change:transform}}
+.card.flip-enter{{opacity:0;transform:scale(.96)}}
+.card.just-moved{{animation:mc-pulse .7s ease-out}}
+@keyframes mc-pulse{{
+  0%{{box-shadow:0 0 0 0 var(--ac),var(--sh)}}
+  60%{{box-shadow:0 0 0 8px rgba(0,0,0,0),var(--sh)}}
+  100%{{box-shadow:0 0 0 0 rgba(0,0,0,0),var(--sh)}}
+}}
+@media(prefers-reduced-motion:reduce){{
+  .card,.card.just-moved{{transition:none!important;animation:none!important}}
+}}
 
 .closed-section{{margin-top:24px;background:var(--bg3);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden}}
 .closed-toggle{{
@@ -1204,11 +1217,16 @@ function renderFilters() {{
   ).join('');
 }}
 
-function renderCard(s) {{
+// Card registry for FLIP reconciliation: session.id -> HTMLElement
+const __mcCards = new Map();
+// Track which card elements already have drag listeners (WeakSet so detached
+// cards get GCed).
+const __mcDragAttached = new WeakSet();
+
+function buildCardInnerHTML(s) {{
   const dark = isDark();
   const wsBg = dark ? s.wsCd : s.wsCl;
   const expanded = state.expanded === s.id;
-  const draggable = isManageMode() && !!API && !state.selectMode;
   const isSelected = state.selected.has(cardKey(s));
   const labels = (s.labels||[]).slice(0, expanded ? 20 : 4).map(l => {{
     const c = dark ? l.cd : l.cl;
@@ -1225,8 +1243,7 @@ function renderCard(s) {{
       <div class="detail-row"><span class="detail-label">Model</span><span>${{s.model||'?'}}</span></div>
     </div>` : '';
 
-  return `<div class="card ${{expanded?'expanded':''}} ${{draggable?'draggable':''}} ${{isSelected?'selected':''}}" data-id="${{esc(s.id)}}" data-ws="${{esc(s.wsId)}}" ${{draggable?'draggable="true"':''}}>
-  <div class="card-check-wrap"><input type="checkbox" class="card-check" ${{isSelected?'checked':''}}></div>
+  return `<div class="card-check-wrap"><input type="checkbox" class="card-check" ${{isSelected?'checked':''}}></div>
   <div class="card-top">
     <span class="dot s-${{stale(s.lastUsedAt)}}"></span>
     ${{s.flagged?'<span class="flag">&#9733;</span>':''}}
@@ -1251,8 +1268,33 @@ function renderCard(s) {{
       </button>
     </span>
   </div>
-  ${{details}}
-</div>`;
+  ${{details}}`;
+}}
+
+function applyCardAttrs(el, s) {{
+  const expanded = state.expanded === s.id;
+  const draggable = isManageMode() && !!API && !state.selectMode;
+  const isSelected = state.selected.has(cardKey(s));
+  el.className = 'card' +
+    (expanded ? ' expanded' : '') +
+    (draggable ? ' draggable' : '') +
+    (isSelected ? ' selected' : '');
+  el.dataset.id = s.id;
+  el.dataset.ws = s.wsId;
+  if (draggable) el.setAttribute('draggable', 'true');
+  else el.removeAttribute('draggable');
+}}
+
+function getOrCreateCardEl(s) {{
+  let el = __mcCards.get(s.id);
+  const isNew = !el;
+  if (isNew) {{
+    el = document.createElement('div');
+    __mcCards.set(s.id, el);
+  }}
+  applyCardAttrs(el, s);
+  el.innerHTML = buildCardInnerHTML(s);
+  return {{ el, isNew }};
 }}
 
 function renderBoard() {{
@@ -1267,6 +1309,8 @@ function renderBoard() {{
   const boardEl = document.getElementById('board');
 
   if (boardSessions.length === 0 && state.search) {{
+    __mcCards.forEach(el => {{ if (el.isConnected) el.remove(); }});
+    __mcCards.clear();
     boardEl.innerHTML = `<div class="no-results"><div class="no-results-icon">&#128269;</div><div class="no-results-text">No sessions match "${{esc(state.search)}}"</div></div>`;
     boardEl.classList.remove('drag-enabled');
     return;
@@ -1274,19 +1318,108 @@ function renderBoard() {{
 
   boardEl.classList.toggle('drag-enabled', manage && !!API && !state.selectMode);
 
+  // F (First): snapshot positions of currently mounted cards before any mutation.
+  const first = new Map();
+  const prevStatus = new Map();
+  __mcCards.forEach((el, id) => {{
+    if (el.isConnected) {{
+      first.set(id, el.getBoundingClientRect());
+      prevStatus.set(id, el.dataset.status || '');
+    }}
+  }});
+
+  // Build column shells (empty); cards will be appended next so they retain identity.
+  const visibleIds = new Set(boardSessions.map(s => s.id));
+  const countsByCol = {{}};
+  for (const col of statusCols) countsByCol[col.id] = 0;
+  for (const s of boardSessions) if (countsByCol[s.status] !== undefined) countsByCol[s.status]++;
+
   boardEl.innerHTML = statusCols.map(col => {{
-    const sessions = boardSessions.filter(s => s.status === col.id).sort(sortFn(state.sort));
-    const cards = sessions.map(renderCard).join('') || '<div class="empty">No sessions</div>';
     const isClosed = col.category === 'closed';
     return `<div class="col ${{isClosed ? 'col-closed' : ''}}" data-status="${{esc(col.id)}}">
       <div class="col-head ${{isClosed ? 'col-head-closed' : ''}}">
         <span class="col-title">${{esc(col.label)}}</span>
-        <span class="col-count">${{sessions.length}}</span>
+        <span class="col-count">${{countsByCol[col.id]||0}}</span>
         ${{manage && !isClosed ? `<button class="new-btn col-new-btn" data-newws="${{esc(state.selectedWs)}}" title="New session">+</button>` : ''}}
       </div>
-      <div class="col-cards" data-status="${{esc(col.id)}}">${{cards}}</div>
+      <div class="col-cards" data-status="${{esc(col.id)}}"></div>
     </div>`;
   }}).join('');
+
+  // Populate columns with reused/new card nodes.
+  const entering = new Set();
+  statusCols.forEach(col => {{
+    const zone = boardEl.querySelector(`.col-cards[data-status="${{CSS.escape(col.id)}}"]`);
+    if (!zone) return;
+    const sessions = boardSessions.filter(s => s.status === col.id).sort(sortFn(state.sort));
+    if (sessions.length === 0) {{
+      zone.innerHTML = '<div class="empty">No sessions</div>';
+      return;
+    }}
+    sessions.forEach(s => {{
+      const {{ el, isNew }} = getOrCreateCardEl(s);
+      if (isNew) entering.add(el);
+      el.dataset.status = col.id;
+      zone.appendChild(el);
+    }});
+  }});
+
+  // Drop cards no longer visible.
+  __mcCards.forEach((el, id) => {{
+    if (!visibleIds.has(id)) {{
+      if (el.isConnected) el.remove();
+      __mcCards.delete(id);
+    }}
+  }});
+
+  // FLIP play. Skip when user prefers reduced motion.
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!reduced) {{
+    const tasks = [];
+    __mcCards.forEach((el, id) => {{
+      if (entering.has(el)) {{
+        el.classList.add('flip-enter');
+        tasks.push({{ el, kind: 'enter', moved: false }});
+        return;
+      }}
+      const prev = first.get(id);
+      if (!prev) return;
+      const now = el.getBoundingClientRect();
+      const dx = prev.left - now.left;
+      const dy = prev.top - now.top;
+      if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+      el.style.transition = 'none';
+      el.style.transform = `translate(${{dx}}px, ${{dy}}px)`;
+      const movedCol = (prevStatus.get(id) || '') !== (el.dataset.status || '');
+      tasks.push({{ el, kind: 'move', moved: movedCol }});
+    }});
+
+    if (tasks.length) {{
+      // Force styles to apply, then play on next frame with a gentle stagger.
+      void boardEl.offsetHeight;
+      requestAnimationFrame(() => {{
+        tasks.forEach((t, i) => {{
+          const delay = Math.min(i * 30, 180);
+          t.el.style.transition = `transform 420ms cubic-bezier(.2,.8,.2,1) ${{delay}}ms, opacity 260ms ease ${{delay}}ms`;
+          if (t.kind === 'enter') {{
+            t.el.classList.remove('flip-enter');
+          }} else {{
+            t.el.style.transform = '';
+            if (t.moved) {{
+              t.el.classList.add('just-moved');
+              setTimeout(() => t.el.classList.remove('just-moved'), 700 + delay);
+            }}
+          }}
+          const cleanup = () => {{
+            t.el.style.transition = '';
+            t.el.style.transform = '';
+            t.el.removeEventListener('transitionend', cleanup);
+          }};
+          t.el.addEventListener('transitionend', cleanup);
+        }});
+      }});
+    }}
+  }}
 
   if (manage && API && !state.selectMode) setupDragDrop();
 }}
@@ -1527,6 +1660,7 @@ function renderAll() {{
 
 // ─── Drag & Drop ─────────────────────────────────────
 function setupDragDrop() {{
+  // Drop-zone listeners: zones are rebuilt each render, so always re-attach.
   document.querySelectorAll('.col-cards[data-status]').forEach(zone => {{
     zone.addEventListener('dragover', e => {{
       e.preventDefault();
@@ -1548,17 +1682,22 @@ function setupDragDrop() {{
     }});
   }});
 
+  // Card listeners: cards are reused across renders, so attach once per element.
   document.querySelectorAll('.card.draggable').forEach(card => {{
+    if (__mcDragAttached.has(card)) return;
+    __mcDragAttached.add(card);
     card.addEventListener('dragstart', e => {{
       e.dataTransfer.setData('text/plain', card.dataset.id);
       e.dataTransfer.setData('application/x-ws', card.dataset.ws);
       e.dataTransfer.effectAllowed = 'move';
       card.classList.add('dragging');
-      setTimeout(() => card.style.display = 'none', 0);
+      state.dragging = card.dataset.id;
+      setTimeout(() => {{ card.style.display = 'none'; }}, 0);
     }});
     card.addEventListener('dragend', e => {{
       card.classList.remove('dragging');
       card.style.display = '';
+      state.dragging = null;
       document.querySelectorAll('.drag-over').forEach(z => z.classList.remove('drag-over'));
     }});
   }});
@@ -1793,6 +1932,57 @@ if (urlWs && DATA.workspaces.some(w => w.id === urlWs)) {{
 }}
 renderAll();
 if (!API) toast('View-only mode (open via --serve for drag-and-drop)', 'error');
+
+// ─── Auto-refresh (polling) ──────────────────────────
+// Signature captures only fields that affect board layout/appearance so we
+// skip re-renders when nothing interesting changed.
+function __mcSignature(sessions) {{
+  return sessions.map(s => [
+    s.id, s.status, s.name, s.msgs, s.lastUsedAt,
+    (s.labels || []).map(l => l.d).join(','),
+  ].join('|')).join('\\n');
+}}
+let __mcLastSig = __mcSignature(DATA.sessions);
+let __mcRefreshInFlight = false;
+
+async function refreshData() {{
+  if (!API || __mcRefreshInFlight) return;
+  if (document.hidden) return;
+  // Don't yank cards while user is mid-drag, mid-batch, or has a picker open.
+  if (state.dragging) return;
+  if (document.querySelector('.card.dragging')) return;
+  if (state.labelPicker) return;
+  __mcRefreshInFlight = true;
+  try {{
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000);
+    const res = await fetch(API + '/api/data', {{ signal: ctrl.signal, credentials: 'same-origin' }});
+    clearTimeout(t);
+    if (!res.ok) return;
+    const fresh = await res.json();
+    if (!fresh || !Array.isArray(fresh.sessions)) return;
+    const sig = __mcSignature(fresh.sessions);
+    if (sig === __mcLastSig) return;
+    __mcLastSig = sig;
+    DATA.sessions = fresh.sessions;
+    if (Array.isArray(fresh.workspaces)) DATA.workspaces = fresh.workspaces;
+    if (Array.isArray(fresh.statuses)) DATA.statuses = fresh.statuses;
+    renderAll();
+  }} catch (_) {{
+    // Network hiccup / abort; next tick will try again.
+  }} finally {{
+    __mcRefreshInFlight = false;
+  }}
+}}
+
+window.__mcRefresh = refreshData;
+
+if (API) {{
+  setInterval(refreshData, 3000);
+  document.addEventListener('visibilitychange', () => {{
+    if (!document.hidden) refreshData();
+  }});
+}}
 </script>
 </body>
 </html>'''

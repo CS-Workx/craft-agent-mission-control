@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 _Nothing yet — see [ROADMAP.md](ROADMAP.md) for what's coming._
 
+## [2.2.0] — 2026-04-17
+
+### Added
+
+- **Live auto-refresh.** The dashboard now polls `/api/data` every 3 seconds (when the tab is visible) and picks up external session changes — relabels, status moves, renames — without a page reload. Manual trigger exposed as `window.__mcRefresh()` for debugging.
+- **Animated column-to-column moves.** When a session's status changes (from anywhere — a drag, a batch op, or an external script), the card node is reused and glides from its old column to its new one using the FLIP technique (First-Last-Invert-Play). A short accent pulse highlights cards that actually changed columns, with a gentle stagger when multiple cards move in the same tick.
+- **`prefers-reduced-motion` support.** Animations are suppressed for users with the OS-level reduced-motion preference enabled.
+
+### Changed
+
+- **`renderBoard` reconciles instead of wiping `innerHTML`.** Card DOM nodes persist across renders in a registry keyed by session id, so each card keeps its identity when it moves. Column shells are still rebuilt on each render (cheap) but cards are re-parented, which is what makes the FLIP animation possible.
+- **`renderCard` split into `buildCardInnerHTML` + `applyCardAttrs`.** The inner HTML is recomputed on every render (still cheap), but the outer `.card` element is reused. Drag listeners are now attached via a `WeakSet` guard so reused cards never accumulate duplicate handlers.
+- **Refresh is suppressed while the user is mid-drag, has a label picker open, or the tab is hidden** — avoids yanking the UI out from under the user.
+
 ## [2.1.0] — 2026-04-17
 
 ### Added
