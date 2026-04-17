@@ -5,10 +5,13 @@ Mission Control is a zero-dependency, single-file Python dashboard. The roadmap 
 ## Near-term (v2.x)
 
 - **Tests** — unit tests for `collect()`, `build_data()`, and the status-change API. Pytest with fixtures mocking a fake `~/.craft-agent/workspaces/` tree.
-- **Cross-platform auto-start** — systemd unit for Linux, Task Scheduler script for Windows. Current Launch Agent is macOS-only.
 - **Automation integration** — route status changes through Craft Agents' internal API (if exposed) so `SessionStatusChange` automations fire correctly. Today the dashboard writes `session.jsonl` directly, which bypasses the event bus.
 - **Keyboard shortcuts** — batch-select navigation, archive paging (j/k), quick status change (1/2/3 for todo/in-progress/done).
 - **Saved filter presets** — persist `?ws=…&search=…&sort=…` combinations locally as named views.
+
+## Recently shipped
+
+- **Cross-platform auto-start** (v2.1.0) — systemd user unit for Linux, Scheduled Task via `schtasks.exe` for Windows, plus a single `install.py` that dispatches per-OS. macOS Launch Agent still works unchanged.
 
 ## Mid-term (v3.0)
 

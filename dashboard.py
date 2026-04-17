@@ -9,9 +9,10 @@ Usage:
 Server mode enables drag-and-drop status changes via a local API.
 """
 
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -24,14 +25,21 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+logger = logging.getLogger("mission-control")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-NOW_MS = int(time.time() * 1000)
-CRAFT_DIR = Path(os.path.expanduser("~/.craft-agent"))
+CRAFT_DIR = Path(os.environ.get("CRAFT_HOME") or os.path.expanduser("~/.craft-agent"))
 WORKSPACES_DIR = CRAFT_DIR / "workspaces"
 
 SESSION_ID_RE = re.compile(r"^\d{6}-[a-z]+-[a-z]+$")
 WS_DIR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+STATUS_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+MAX_BODY = 64 * 1024
+MAX_LABELS = 32
+MAX_LABEL_LEN = 128
+MAX_URL_LEN = 2048
 
 WS_COLORS = [
     ("#8b5cf6", "#a78bfa"), ("#3b82f6", "#60a5fa"), ("#10b981", "#34d399"),
@@ -71,6 +79,43 @@ def model_short(model):
 
 # ─── Data Collection ─────────────────────────────────────────────────────────
 
+# Cache: path -> (mtime_ns, parsed_header) so repeated /api/data requests
+# don't re-parse every session file when nothing has changed.
+_COLLECT_CACHE = {}  # type: dict
+
+
+def _read_json_file(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        logger.warning("failed to parse %s: %s", path, e)
+        return None
+
+
+def _read_session_header(path):
+    """Return the parsed first-line header of session.jsonl, using an mtime cache."""
+    try:
+        st = path.stat()
+    except OSError as e:
+        logger.warning("failed to stat %s: %s", path, e)
+        return None
+    key = str(path)
+    cached = _COLLECT_CACHE.get(key)
+    if cached and cached[0] == st.st_mtime_ns:
+        return cached[1]
+    try:
+        with open(path) as f:
+            line = f.readline().strip()
+        if not line:
+            return None
+        header = json.loads(line)
+    except Exception as e:
+        logger.warning("failed to parse %s: %s", path, e)
+        return None
+    _COLLECT_CACHE[key] = (st.st_mtime_ns, header)
+    return header
+
+
 def collect():
     workspaces = []
     if not WORKSPACES_DIR.exists():
@@ -80,13 +125,12 @@ def collect():
     app_uuid_map = {}
     top_config = CRAFT_DIR / "config.json"
     if top_config.exists():
-        try:
-            for ws_entry in json.loads(top_config.read_text()).get("workspaces", []):
+        top_data = _read_json_file(top_config)
+        if top_data:
+            for ws_entry in top_data.get("workspaces", []):
                 slug = ws_entry.get("slug", "")
                 if slug:
                     app_uuid_map[slug] = ws_entry.get("id", "")
-        except Exception:
-            pass
 
     for ws_dir in sorted(WORKSPACES_DIR.iterdir()):
         if not ws_dir.is_dir() or ws_dir.name.startswith("."):
@@ -94,9 +138,8 @@ def collect():
         config_path = ws_dir / "config.json"
         if not config_path.exists():
             continue
-        try:
-            config = json.loads(config_path.read_text())
-        except Exception:
+        config = _read_json_file(config_path)
+        if config is None:
             continue
 
         # Load workspace theme
@@ -105,18 +148,11 @@ def collect():
         if theme_name:
             theme_path = CRAFT_DIR / "themes" / f"{theme_name}.json"
             if theme_path.exists():
-                try:
-                    theme = json.loads(theme_path.read_text())
-                except Exception:
-                    pass
+                theme = _read_json_file(theme_path)
         if not theme:
-            # Load default theme
             default_path = CRAFT_DIR / "themes" / "default.json"
             if default_path.exists():
-                try:
-                    theme = json.loads(default_path.read_text())
-                except Exception:
-                    pass
+                theme = _read_json_file(default_path)
 
         ws = {
             "dir_name": ws_dir.name,
@@ -131,23 +167,21 @@ def collect():
 
         st_path = ws_dir / "statuses" / "config.json"
         if st_path.exists():
-            try:
-                ws["statuses_raw"] = json.loads(st_path.read_text()).get("statuses", [])
-            except Exception:
-                pass
+            st_data = _read_json_file(st_path)
+            if st_data:
+                ws["statuses_raw"] = st_data.get("statuses", [])
 
         lb_path = ws_dir / "labels" / "config.json"
         if lb_path.exists():
-            try:
+            lb_data = _read_json_file(lb_path)
+            if lb_data:
                 def flatten(labels):
                     for lb in labels:
                         light, dark = resolve_label_color(lb.get("color"))
                         ws["labels"][lb["id"]] = {"name": lb.get("name", lb["id"]), "light": light, "dark": dark}
                         if "children" in lb:
                             flatten(lb["children"])
-                flatten(json.loads(lb_path.read_text()).get("labels", []))
-            except Exception:
-                pass
+                flatten(lb_data.get("labels", []))
 
         sessions_dir = ws_dir / "sessions"
         if sessions_dir.exists():
@@ -157,18 +191,16 @@ def collect():
                 jsonl = sess_dir / "session.jsonl"
                 if not jsonl.exists():
                     continue
-                try:
-                    with open(jsonl) as f:
-                        line = f.readline().strip()
-                    if line:
-                        ws["sessions"].append(json.loads(line))
-                except Exception:
-                    continue
+                header = _read_session_header(jsonl)
+                if header is not None:
+                    ws["sessions"].append(header)
         workspaces.append(ws)
     return workspaces
 
 
-def build_data(workspaces):
+def build_data(workspaces, now_ms=None):
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
     color_map = {}
     ws_list = []
     for i, ws in enumerate(workspaces):
@@ -262,7 +294,7 @@ def build_data(workspaces):
             })
 
     return {
-        "now": NOW_MS,
+        "now": now_ms,
         "workspaces": ws_list,
         "sessions": sessions,
     }
@@ -375,15 +407,14 @@ def get_workspace_labels(ws_dir_name):
 
 def get_alerts():
     """Return sessions needing attention (stale 7d+, open status)."""
-    global NOW_MS
-    NOW_MS = int(time.time() * 1000)
+    now_ms = int(time.time() * 1000)
     workspaces = collect()
-    data = build_data(workspaces)
+    data = build_data(workspaces, now_ms=now_ms)
     alerts = []
     for s in data["sessions"]:
         if s["status"] in ("done", "cancelled"):
             continue
-        age_days = (NOW_MS - (s.get("lastUsedAt") or 0)) / 86400000
+        age_days = (now_ms - (s.get("lastUsedAt") or 0)) / 86400000
         if age_days >= 7:
             alerts.append({
                 "type": "stale",
@@ -873,7 +904,9 @@ function getStatusColumns() {{
     return ws ? ws.statuses : [];
   }}
   const closedIds = new Set(getClosedStatuses().map(s => s.id));
-  const ALWAYS_SHOW = new Set(['todo', 'automated']);
+  // 'todo' is the default status for new sessions; always show it even when
+  // no sessions are in that column yet.
+  const ALWAYS_SHOW = new Set(['todo']);
   const statusMap = {{}};
   for (const ws of DATA.workspaces) {{
     for (const s of ws.statuses) {{
@@ -1165,9 +1198,9 @@ function renderFilters() {{
     const active = state.activeWs.has(ws.id);
     const c = dark ? ws.cd : ws.cl;
     const st = active ? `background:${{c}};color:#fff;border-color:${{c}}` : `background:transparent;color:${{c}};border-color:${{c}}`;
-    return `<span class="fpill ${{active?'active':'inactive'}}" data-ws="${{ws.id}}" style="${{st}}">${{esc(ws.name)}} <span class="pc">${{ws.count}}</span></span>`;
+    return `<span class="fpill ${{active?'active':'inactive'}}" data-ws="${{esc(ws.id)}}" style="${{st}}">${{esc(ws.name)}} <span class="pc">${{ws.count}}</span></span>`;
   }}).join('') + DATA.workspaces.map(ws =>
-    `<button class="new-btn" data-newws="${{ws.id}}" title="New session in ${{esc(ws.name)}}">+</button>`
+    `<button class="new-btn" data-newws="${{esc(ws.id)}}" title="New session in ${{esc(ws.name)}}">+</button>`
   ).join('');
 }}
 
@@ -1192,7 +1225,7 @@ function renderCard(s) {{
       <div class="detail-row"><span class="detail-label">Model</span><span>${{s.model||'?'}}</span></div>
     </div>` : '';
 
-  return `<div class="card ${{expanded?'expanded':''}} ${{draggable?'draggable':''}} ${{isSelected?'selected':''}}" data-id="${{s.id}}" data-ws="${{s.wsId}}" ${{draggable?'draggable="true"':''}}>
+  return `<div class="card ${{expanded?'expanded':''}} ${{draggable?'draggable':''}} ${{isSelected?'selected':''}}" data-id="${{esc(s.id)}}" data-ws="${{esc(s.wsId)}}" ${{draggable?'draggable="true"':''}}>
   <div class="card-check-wrap"><input type="checkbox" class="card-check" ${{isSelected?'checked':''}}></div>
   <div class="card-top">
     <span class="dot s-${{stale(s.lastUsedAt)}}"></span>
@@ -1209,10 +1242,10 @@ function renderCard(s) {{
   <div class="card-meta">
     <span>${{relTime(s.lastUsedAt)}} &middot; ${{s.msgs}} msgs</span>
     <span style="display:flex;gap:4px;align-items:center">
-      ${{API ? `<button class="label-btn" data-sid="${{s.id}}" data-ws="${{s.wsId}}" title="Manage labels">
+      ${{API ? `<button class="label-btn" data-sid="${{esc(s.id)}}" data-ws="${{esc(s.wsId)}}" title="Manage labels">
         <svg viewBox="0 0 24 24"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
       </button>` : ''}}
-      <button class="open-btn" data-sid="${{s.id}}" data-sdksid="${{s.sdkSid}}" data-wsuuid="${{s.wsUuid}}" title="Open in Craft Agents">
+      <button class="open-btn" data-sid="${{esc(s.id)}}" data-sdksid="${{esc(s.sdkSid)}}" data-wsuuid="${{esc(s.wsUuid)}}" title="Open in Craft Agents">
         <svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
         Open
       </button>
@@ -1245,13 +1278,13 @@ function renderBoard() {{
     const sessions = boardSessions.filter(s => s.status === col.id).sort(sortFn(state.sort));
     const cards = sessions.map(renderCard).join('') || '<div class="empty">No sessions</div>';
     const isClosed = col.category === 'closed';
-    return `<div class="col ${{isClosed ? 'col-closed' : ''}}" data-status="${{col.id}}">
+    return `<div class="col ${{isClosed ? 'col-closed' : ''}}" data-status="${{esc(col.id)}}">
       <div class="col-head ${{isClosed ? 'col-head-closed' : ''}}">
         <span class="col-title">${{esc(col.label)}}</span>
         <span class="col-count">${{sessions.length}}</span>
-        ${{manage && !isClosed ? `<button class="new-btn col-new-btn" data-newws="${{state.selectedWs}}" title="New session">+</button>` : ''}}
+        ${{manage && !isClosed ? `<button class="new-btn col-new-btn" data-newws="${{esc(state.selectedWs)}}" title="New session">+</button>` : ''}}
       </div>
-      <div class="col-cards" data-status="${{col.id}}">${{cards}}</div>
+      <div class="col-cards" data-status="${{esc(col.id)}}">${{cards}}</div>
     </div>`;
   }}).join('');
 
@@ -1350,8 +1383,8 @@ function renderArchive() {{
       <td class="cm">${{fmtCost(s.cost)}}</td>
       <td class="cm">${{s.msgs}}</td>
       <td class="archive-actions">
-        ${{API ? `<button class="reopen-btn" data-sid="${{s.id}}" data-ws="${{s.wsId}}">Reopen</button>` : ''}}
-        <button class="open-btn" data-sid="${{s.id}}" data-sdksid="${{s.sdkSid}}" data-wsuuid="${{s.wsUuid}}" title="Open in Craft Agents">
+        ${{API ? `<button class="reopen-btn" data-sid="${{esc(s.id)}}" data-ws="${{esc(s.wsId)}}">Reopen</button>` : ''}}
+        <button class="open-btn" data-sid="${{esc(s.id)}}" data-sdksid="${{esc(s.sdkSid)}}" data-wsuuid="${{esc(s.wsUuid)}}" title="Open in Craft Agents">
           <svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
         </button>
       </td></tr>`;
@@ -1399,8 +1432,8 @@ function showLabelPicker(sid, wsId, anchorEl) {{
   picker.innerHTML = labelDefs.map(lb => {{
     const checked = rawLabels.has(lb.id);
     const c = dark ? lb.cd : lb.cl;
-    return `<label class="label-picker-item" data-lid="${{lb.id}}">
-      <input type="checkbox" class="label-check" value="${{lb.id}}" ${{checked?'checked':''}}>
+    return `<label class="label-picker-item" data-lid="${{esc(lb.id)}}">
+      <input type="checkbox" class="label-check" value="${{esc(lb.id)}}" ${{checked?'checked':''}}>
       <span class="label-dot" style="background:${{c}}"></span>
       <span>${{esc(lb.name)}}</span>
     </label>`;
@@ -1765,6 +1798,29 @@ if (!API) toast('View-only mode (open via --serve for drag-and-drop)', 'error');
 </html>'''
 
 
+# ─── Cross-platform URL open ────────────────────────────────────────────────
+
+def _open_url(url):
+    """Open a URL via the platform's default handler.
+
+    Returns True on success, False otherwise. macOS → `open`, Linux → `xdg-open`,
+    Windows → `os.startfile`. Failures are logged but not raised.
+    """
+    try:
+        if sys.platform == "darwin":
+            rc = subprocess.run(["open", url], capture_output=True, timeout=5).returncode
+            return rc == 0
+        if sys.platform.startswith("linux"):
+            rc = subprocess.run(["xdg-open", url], capture_output=True, timeout=5).returncode
+            return rc == 0
+        if sys.platform == "win32":
+            os.startfile(url)  # type: ignore[attr-defined]  # Windows-only
+            return True
+    except Exception as e:
+        logger.warning("deeplink open failed for %s: %s", url, e)
+    return False
+
+
 # ─── HTTP Server ─────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -1790,6 +1846,40 @@ class Handler(BaseHTTPRequestHandler):
         allowed = (f"http://localhost:{port}", f"http://127.0.0.1:{port}")
         return origin in allowed
 
+    def _read_json_body(self):
+        """Read and parse a JSON POST body with size cap + parse guard.
+
+        On success returns the parsed object. On failure writes the error
+        response and returns None — the caller should bail immediately.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            self._json(400, {"ok": False, "error": "Invalid Content-Length"})
+            return None
+        if length <= 0:
+            self._json(400, {"ok": False, "error": "Empty body"})
+            return None
+        if length > MAX_BODY:
+            self._json(413, {"ok": False, "error": "Body too large"})
+            return None
+        try:
+            raw = self.rfile.read(length)
+            return json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            self._json(400, {"ok": False, "error": "Invalid JSON"})
+            return None
+
+    def _valid_status(self, value):
+        return isinstance(value, str) and bool(STATUS_RE.match(value))
+
+    def _valid_labels(self, value):
+        if not isinstance(value, list):
+            return False
+        if len(value) > MAX_LABELS:
+            return False
+        return all(isinstance(lb, str) and 0 < len(lb) <= MAX_LABEL_LEN for lb in value)
+
     def _html(self, code, html):
         body = html.encode()
         self.send_response(code)
@@ -1804,10 +1894,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _refresh_data(self):
         """Re-collect workspace/session data for live updates."""
-        global NOW_MS
-        NOW_MS = int(time.time() * 1000)
+        now_ms = int(time.time() * 1000)
         workspaces = collect()
-        Handler.data = build_data(workspaces)
+        Handler.data = build_data(workspaces, now_ms=now_ms)
         Handler.html = generate_html(Handler.data, api_base=Handler.api_base)
 
     def do_GET(self):
@@ -1828,7 +1917,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, {"ok": True, "labels": get_workspace_labels(ws_dir)})
         elif path == "/health":
-            self._json(200, {"ok": True, "pid": os.getpid(), "version": __version__})
+            self._json(200, {"ok": True, "version": __version__})
         else:
             self.send_error(404)
 
@@ -1838,42 +1927,60 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = self.path.split("?")[0]
         if path == "/api/status":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body = self._read_json_body()
+            if body is None:
+                return
             sid = body.get("sessionId")
             ws = body.get("wsDir")
             ns = body.get("newStatus")
-            if not all([sid, ws, ns]):
+            if not sid or not ws or not ns:
                 self._json(400, {"ok": False, "error": "Missing fields"})
+                return
+            if not self._valid_status(ns):
+                self._json(400, {"ok": False, "error": "Invalid status"})
                 return
             ok, msg = update_session_status(ws, sid, ns)
             if ok:
                 self._refresh_data()
             self._json(200 if ok else 400, {"ok": ok, "message": msg} if ok else {"ok": False, "error": msg})
         elif path == "/api/labels":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body = self._read_json_body()
+            if body is None:
+                return
             sid = body.get("sessionId")
             ws = body.get("wsDir")
             labels = body.get("labels")
-            if not all([sid, ws]) or labels is None:
+            if not sid or not ws or labels is None:
                 self._json(400, {"ok": False, "error": "Missing fields"})
+                return
+            if not self._valid_labels(labels):
+                self._json(400, {"ok": False, "error": "Invalid labels"})
                 return
             ok, result = update_session_labels(ws, sid, labels)
             if ok:
                 self._refresh_data()
             self._json(200 if ok else 400, {"ok": ok, "labels": result} if ok else {"ok": False, "error": result})
         elif path == "/api/batch/status":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body = self._read_json_body()
+            if body is None:
+                return
             items = body.get("items", [])
             new_status = body.get("newStatus")
             if not items or not new_status:
                 self._json(400, {"ok": False, "error": "Missing fields"})
                 return
+            if not isinstance(items, list) or len(items) > 500:
+                self._json(400, {"ok": False, "error": "Invalid items"})
+                return
+            if not self._valid_status(new_status):
+                self._json(400, {"ok": False, "error": "Invalid status"})
+                return
             updated, failed = 0, 0
             for item in items:
-                ok, _ = update_session_status(item["wsDir"], item["sessionId"], new_status)
+                if not isinstance(item, dict):
+                    failed += 1
+                    continue
+                ok, _ = update_session_status(item.get("wsDir"), item.get("sessionId"), new_status)
                 if ok:
                     updated += 1
                 else:
@@ -1881,45 +1988,44 @@ class Handler(BaseHTTPRequestHandler):
             self._refresh_data()
             self._json(200, {"ok": True, "updated": updated, "failed": failed})
         elif path == "/api/open-url":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body = self._read_json_body()
+            if body is None:
+                return
             url = body.get("url", "")
-            if not url.startswith("craftagents://"):
+            if not isinstance(url, str) or not url.startswith("craftagents://"):
                 self._json(400, {"ok": False, "error": "Only craftagents:// URLs allowed"})
                 return
-            try:
-                result = subprocess.run(["open", url], capture_output=True, timeout=5)
-                self._json(200 if result.returncode == 0 else 500,
-                    {"ok": result.returncode == 0, "url": url})
-            except Exception as e:
-                self._json(500, {"ok": False, "error": str(e)})
+            if len(url) > MAX_URL_LEN or any(ord(c) < 0x20 for c in url):
+                self._json(400, {"ok": False, "error": "Invalid URL"})
+                return
+            ok = _open_url(url)
+            self._json(200 if ok else 500, {"ok": ok, "url": url})
         elif path == "/api/open":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body = self._read_json_body()
+            if body is None:
+                return
             session_id = body.get("sessionId", "")
             sdk_sid = body.get("sdkSessionId", "")
             ws_uuid = body.get("wsUuid", "")
             if not session_id:
                 self._json(400, {"ok": False, "error": "Missing sessionId"})
                 return
+            if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+                self._json(400, {"ok": False, "error": "Invalid sessionId"})
+                return
             if ws_uuid:
                 url = f"craftagents://workspace/{ws_uuid}/allSessions/session/{session_id}"
             else:
                 url = f"craftagents://allSessions/session/{session_id}"
-            try:
-                result = subprocess.run(["open", url], capture_output=True, timeout=5)
-                if result.returncode == 0:
-                    self._json(200, {"ok": True, "method": "deeplink", "url": url})
-                else:
-                    if sdk_sid:
-                        fb_url = f"craftagents://allSessions/session/{sdk_sid}"
-                        result2 = subprocess.run(["open", fb_url], capture_output=True, timeout=5)
-                        if result2.returncode == 0:
-                            self._json(200, {"ok": True, "method": "deeplink-uuid", "url": fb_url})
-                            return
-                    self._json(500, {"ok": False, "error": "deeplink failed"})
-            except Exception as e:
-                self._json(500, {"ok": False, "error": str(e)})
+            if _open_url(url):
+                self._json(200, {"ok": True, "method": "deeplink", "url": url})
+                return
+            if sdk_sid and isinstance(sdk_sid, str):
+                fb_url = f"craftagents://allSessions/session/{sdk_sid}"
+                if _open_url(fb_url):
+                    self._json(200, {"ok": True, "method": "deeplink-uuid", "url": fb_url})
+                    return
+            self._json(500, {"ok": False, "error": "deeplink failed"})
         else:
             self.send_error(404)
 

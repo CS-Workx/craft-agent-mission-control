@@ -14,7 +14,9 @@ Part of the [Superworker Toolbox](https://github.com/CoachSteff).
 
 ## Quick Install
 
-### Manual (recommended — you see every command)
+Mission Control ships with one installer brain (`install.py`) and thin shell + PowerShell wrappers. Pick the flavor for your platform.
+
+### macOS / Linux
 
 ```bash
 git clone https://github.com/CS-Workx/craft-agent-mission-control.git
@@ -22,7 +24,21 @@ cd craft-agent-mission-control
 bash install.sh
 ```
 
-### One-liner (for the trusting)
+### Windows
+
+```powershell
+git clone https://github.com/CS-Workx/craft-agent-mission-control.git
+cd craft-agent-mission-control
+pwsh install.ps1
+```
+
+### Any platform (direct)
+
+```bash
+python3 install.py
+```
+
+### One-liner (for the trusting, macOS/Linux only)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CS-Workx/craft-agent-mission-control/main/install.sh | bash
@@ -34,11 +50,11 @@ curl -fsSL https://raw.githubusercontent.com/CS-Workx/craft-agent-mission-contro
 set -e
 TMP=$(mktemp -d)
 git clone --depth 1 https://github.com/CS-Workx/craft-agent-mission-control.git "$TMP"
-bash "$TMP/install.sh" --yes
+python3 "$TMP/install.py" --yes
 curl -fsS http://localhost:9753/health
 ```
 
-Success looks like `{"ok": true, "pid": <number>, "version": "2.0.0"}`.
+Success looks like `{"ok": true, "version": "2.1.0"}`.
 
 👉 **Full installation guide, prerequisites, and troubleshooting: [INSTALL.md](INSTALL.md)**
 
@@ -61,7 +77,7 @@ Success looks like `{"ok": true, "pid": <number>, "version": "2.0.0"}`.
 - **Workspace theming** — loads theme colors from Craft Agents workspace config
 - **Light/dark mode** — responds to system `prefers-color-scheme`
 - **Stats header** — total visible, open, active 24h, stale 7d+, total cost, workspace count
-- **Auto-start** — macOS Launch Agent starts the server on login and restarts on crash
+- **Auto-start** — macOS Launch Agent / Linux systemd user unit / Windows Scheduled Task — the server starts on login and restarts on crash on all three platforms
 - **Zero dependencies** — Python 3 stdlib only, nothing to install
 
 ## Usage
@@ -99,7 +115,7 @@ From any Craft Agents session, invoke the `[skill:mission-control]` skill. It op
 |--------|------|---------|
 | GET | `/` | Serves the dashboard (re-collects data on every load) |
 | GET | `/api/data` | Returns collected data as JSON |
-| GET | `/health` | Health check (`{"ok": true, "pid": N, "version": "2.0.0"}`) |
+| GET | `/health` | Health check (`{"ok": true, "version": "2.1.0"}`) |
 | GET | `/api/alerts` | Stale session alerts (sessions inactive 7+ days) |
 | GET | `/api/workspace-labels` | Label config for a workspace |
 | POST | `/api/status` | Update session status |
@@ -130,15 +146,33 @@ The entire dashboard is a single self-contained HTML page. Data is embedded as a
 
 ## Management
 
+**macOS:**
+
 ```bash
-# Restart the server
 launchctl unload ~/Library/LaunchAgents/com.craft-agent.mission-control.plist
 launchctl load ~/Library/LaunchAgents/com.craft-agent.mission-control.plist
-
-# View logs
 tail -n 50 /tmp/mission-control.log
+```
 
-# Health check
+**Linux:**
+
+```bash
+systemctl --user restart mission-control.service
+systemctl --user status mission-control.service
+tail -n 50 ~/.local/state/mission-control/mission-control.log
+```
+
+**Windows (PowerShell):**
+
+```powershell
+schtasks.exe /End /TN CraftAgentMissionControl
+schtasks.exe /Run /TN CraftAgentMissionControl
+schtasks.exe /Query /TN CraftAgentMissionControl
+```
+
+**Health check (any OS):**
+
+```bash
 curl http://localhost:9753/health
 ```
 
@@ -146,9 +180,11 @@ curl http://localhost:9753/health
 
 1. **Status changes via drag-and-drop** modify `session.jsonl` directly. This does not trigger Craft Agents automations (e.g., `SessionStatusChange` events) — automations only fire when status changes go through the app's internal API. See [ROADMAP](ROADMAP.md) for the planned fix.
 
-2. **macOS only** for auto-start and deeplinks. The dashboard itself is cross-platform Python; the Launch Agent and `open` command for deeplinks are macOS-specific. Install with `--no-launchd` on Linux/Windows.
+2. **Local workspaces only.** Mission Control reads `~/.craft-agent/workspaces/` from the local filesystem. Headless SDK deployments, remote workspaces, and team-shared instances are out of scope for v2.x — shared-instance mode is a v3.0 roadmap item.
 
 3. **Deeplink session navigation** requires the correct workspace UUID from `~/.craft-agent/config.json` (top-level). The workspace's own config uses a different ID format that won't work for deeplinks.
+
+4. **Linux deeplinks** require `xdg-utils` (preinstalled on most desktop distributions; `apt install xdg-utils` on minimal Debian/Ubuntu). Without it, clicking "Open" on a card will fail cleanly with a toast.
 
 ## Documentation
 

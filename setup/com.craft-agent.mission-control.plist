@@ -10,7 +10,7 @@
         <string>/usr/bin/python3</string>
         <string>/Users/YOUR_USERNAME/.agents/skills/mission-control/dashboard.py</string>
         <string>--serve</string>
-        <string>9753</string>
+        <string>{PORT}</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -23,9 +23,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/tmp/mission-control.log</string>
+    <string>{LOG_PATH}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/mission-control.log</string>
+    <string>{LOG_PATH}</string>
 
     <key>ThrottleInterval</key>
     <integer>10</integer>

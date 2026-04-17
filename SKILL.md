@@ -1,7 +1,13 @@
 ---
 name: "Mission Control"
 description: "Interactive cross-workspace dashboard with kanban board, drag-and-drop, batch operations, label management, CSV export, and archive view"
-alwaysAllow: ["Bash"]
+alwaysAllow:
+  - "browser_tool"
+  - "Read"
+  - "Bash(launchctl:*)"
+  - "Bash(systemctl:*)"
+  - "Bash(schtasks:*)"
+  - "Bash(python3:*)"
 ---
 
 # Mission Control

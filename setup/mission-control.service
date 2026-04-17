@@ -1,0 +1,14 @@
+[Unit]
+Description=Mission Control — Craft Agent kanban dashboard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={PYTHON} {DASHBOARD} --serve {PORT}
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:{LOG_PATH}
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

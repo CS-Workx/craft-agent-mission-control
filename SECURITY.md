@@ -11,6 +11,10 @@ Mission Control is designed for **single-user local machines**. The default conf
 
 **v2.0.1 closed a CSRF vector** where the previous `Access-Control-Allow-Origin: *` header combined with no auth meant any website the user visited could mutate session files through the running server. Mutating `POST` endpoints now reject cross-origin requests, and workspace / session identifiers in request bodies are validated against strict patterns with a resolved-path check to prevent traversal into paths outside `~/.craft-agent/workspaces/`. If you are still running v2.0.0, upgrade.
 
+**v2.1.0 added input validation** — a 64 KB POST body cap, a strict `^[a-z][a-z0-9-]{0,31}$` status regex, label type/length limits, URL length and control-character checks, and a JSON parse guard that no longer leaks stack traces to the browser. Silent `except Exception: pass` blocks in the workspace scanner have been replaced with `logger.warning` calls so malformed `config.json` failures are visible rather than swallowed.
+
+**Local-only by design.** Mission Control reads `~/.craft-agent/workspaces/` from the local filesystem. Headless SDK deployments, remote workspaces, and team-shared instances are out of scope for v2.x — see [INSTALL.md](INSTALL.md) for details. Shared-instance mode is a v3.0 roadmap item.
+
 ### What this means in practice
 
 | Situation | Is it safe? |

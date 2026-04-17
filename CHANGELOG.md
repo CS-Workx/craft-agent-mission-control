@@ -8,6 +8,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 _Nothing yet — see [ROADMAP.md](ROADMAP.md) for what's coming._
 
+## [2.1.0] — 2026-04-17
+
+### Added
+
+- **Cross-platform auto-start.** Linux support via a systemd user unit (`~/.config/systemd/user/mission-control.service`) and Windows support via a Scheduled Task (`schtasks.exe /TN CraftAgentMissionControl`). Mission Control now runs on all three major platforms out of the box. Closes the "Cross-platform auto-start" near-term roadmap item.
+- **`install.py` — single stdlib-only installer brain.** Dispatches per-OS autostart (`launchctl` / `systemctl --user` / `schtasks.exe`), does health check via `urllib` (not `curl`), supports `--port N`, `--no-autostart`, `--yes`, and `--skill-dir PATH`.
+- **`install.ps1` / `uninstall.ps1`** — PowerShell wrappers for Windows users that forward to the Python brain.
+- **`uninstall.py`** — symmetric cross-platform uninstaller that reverses the autostart entries.
+- **Linux systemd user unit template** at `setup/mission-control.service` with parameterized `{PYTHON}`, `{DASHBOARD}`, `{PORT}`, `{LOG_PATH}`.
+- **`CRAFT_HOME` env override.** Setting `CRAFT_HOME` points the server at a different workspaces directory — primarily for the CI smoke test and local development against a sandbox tree.
+
+### Changed
+
+- **`install.sh` and `uninstall.sh` slimmed to thin wrappers** that exec `python3 install.py "$@"` / `python3 uninstall.py "$@"`. Logic lives in one place now.
+- **Deeplink dispatcher** in `dashboard.py` (`/api/open-url`, `/api/open`) is now cross-platform: `open` on macOS, `xdg-open` on Linux, `os.startfile` on Windows. Old code hardcoded `["open", url]`.
+- **Plist template** parameterizes `{PORT}` and `{LOG_PATH}` (previously hardcoded `9753` and `/tmp/mission-control.log`). `install.py` substitutes them at install time.
+- **`/health` response** drops the `pid` field; now returns `{"ok": true, "version": "2.1.0"}`. No known downstream consumers.
+- **CI matrix expanded** to `[ubuntu-latest, macos-latest, windows-latest] × ['3.9', '3.10', '3.11', '3.12']` = 12 configurations for `py_compile`. Added a **PSScriptAnalyzer** job for `install.ps1` / `uninstall.ps1` and a **server smoke test** that boots the server against a `CRAFT_HOME` sandbox and verifies `/health`.
+- **`SKILL.md` `alwaysAllow`** tightened from the blanket `["Bash"]` to scoped entries: `browser_tool`, `Read`, and per-command `Bash(launchctl:*)` / `Bash(systemctl:*)` / `Bash(schtasks:*)` / `Bash(python3:*)`.
+
+### Security
+
+- **Input validation on POST endpoints.** New `_read_json_body()` helper enforces a 64 KB body cap (413) and a JSON parse guard (400 "Invalid JSON" instead of leaking a stack trace). Status values are validated against `^[a-z][a-z0-9-]{0,31}$`, labels must be a list of ≤32 strings each ≤128 chars, and `craftagents://` URLs are capped at 2048 chars with a control-character check.
+- **`session.jsonl` reads now use an mtime-keyed cache.** Repeated `/api/data` requests skip re-parsing session files that haven't changed — mitigates a minor amplification risk on very large workspaces in addition to the performance win.
+
+### Fixed
+
+- Silent `except Exception: pass` blocks in `collect()` replaced with `logger.warning("failed to parse %s: %s", path, e)`. A malformed workspace `config.json` is now visible in stderr instead of being silently dropped from the board.
+- `NOW_MS` module global removed. `build_data()`, `get_alerts()`, and `_refresh_data()` now compute `now_ms` locally and pass it as a parameter — eliminates the latent race if the server ever moves to a threaded request handler.
+- Hardcoded `'automated'` status fallback removed from the JS `ALWAYS_SHOW` set. Only `'todo'` remains pinned (with a comment explaining why).
+- Missing docs — `INSTALL.md`, `SECURITY.md`, `ROADMAP.md`, `CONTRIBUTING.md` — are now copied to `~/.agents/skills/mission-control/` at install time. Previously they existed in the repo but weren't part of `SKILL_FILES`.
+- Data attributes on rendered HTML (`data-id`, `data-ws`, `data-status`, etc.) now pass through `esc()` — defense in depth against injection via maliciously crafted session/workspace identifiers.
+
+### Migration notes
+
+- **Existing macOS users:** re-run `bash install.sh` (now a wrapper → `install.py`). The plist regenerates cleanly. If you consume the `/health` response programmatically, the `pid` field is gone — check for `ok` / `version` only.
+- **No data-file migrations.**
+
 ## [2.0.1] — 2026-04-17
 
 ### Security
@@ -82,7 +120,8 @@ Initial public release.
 - Toast notifications for success/error feedback
 - Craft Agents skill definition (SKILL.md) for invocation from any workspace
 
-[Unreleased]: https://github.com/CS-Workx/craft-agent-mission-control/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/CS-Workx/craft-agent-mission-control/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/CS-Workx/craft-agent-mission-control/releases/tag/v2.1.0
 [2.0.1]: https://github.com/CS-Workx/craft-agent-mission-control/releases/tag/v2.0.1
 [2.0.0]: https://github.com/CS-Workx/craft-agent-mission-control/releases/tag/v2.0.0
 [1.0.0]: https://github.com/CS-Workx/craft-agent-mission-control/releases/tag/v1.0.0
