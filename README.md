@@ -73,6 +73,9 @@ Success looks like `{"ok": true, "version": "2.1.0"}`.
 - **Label management** — tag icon on each card opens a label picker dropdown
 - **Batch operations** — multi-select cards and change status in bulk via a floating action bar
 - **Archive view** — dedicated view for closed sessions with filters, sorting, pagination, and reopen action
+- **Queue view** — six triage lanes (Needs decision, Blocked, Cost spike, Stale but important, Idle automations, Fresh) derived from session metadata. A session can appear in multiple lanes; each card shows the lane rule it matched.
+- **Workspace Health view** — per-workspace cards with open/stale/cost stats, 14-day trend sparklines, review backlog, idle automations, and a health badge (healthy / attention / overloaded). Click a card to drill into the Board scoped to that workspace.
+- **Saved Lenses** — one-click answers to "show me the specific mess I care about." Six built-in stock lenses (Stale > 7d, No labels, Cost spike, Needs Review, Active 24h, Abandoned) plus user-saved lenses that follow you across browsers via a small JSON file. Lenses are bookmarkable via `?lens=ID`.
 - **Stale alerts API** — `GET /api/alerts` returns sessions stale 7+ days for use with scheduled automations
 - **Workspace theming** — loads theme colors from Craft Agents workspace config
 - **Light/dark mode** — responds to system `prefers-color-scheme`

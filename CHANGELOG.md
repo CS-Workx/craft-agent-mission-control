@@ -8,6 +8,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 _Nothing yet — see [ROADMAP.md](ROADMAP.md) for what's coming._
 
+## [3.0.0] — 2026-04-25
+
+The 3.0 release marks the completed shift from "kanban dashboard" to "operations layer" — same constraints (zero dependencies, single file, local-first), larger identity. Three sequential additions land here: Workspace Health (v2.3), Queue tab (v2.4), and Saved Lenses (this release).
+
+### Added
+
+- **Saved Lenses.** A new lens dropdown sits next to the workspace selector. Six built-in stock lenses ship with the app — *Stale > 7d, not done*, *No labels*, *Cost > $5 and idle > 24h*, *Needs Review (any workspace)*, *Active in last 24h*, *Abandoned (≤1 msg, idle 24h+)*. User lenses can be saved from the current view (workspace + search + sort) and follow you across browsers via a small JSON file at `~/.craft-agent/workspaces/.mission-control/lenses.json`.
+- **`?lens=ID` URL parameter.** Lenses are bookmarkable and shareable. Loaded on page init, applied if it matches a stock or user lens.
+- **Two new API endpoints.** `GET /api/lenses` returns saved user lenses; `POST /api/lenses` replaces them. Validated server-side: lens id format, name length, sort value, max 50 lenses. Atomic write via the same `_atomic_write_lines` helper used for session updates.
+
+### Changed
+
+- **`matchesFilters` now consults the active stock lens** in addition to workspace + search filters. User lenses don't add a predicate — they restore filter state — so they're orthogonal.
+
+## [2.4.0] — 2026-04-25
+
+### Added
+
+- **Queue tab.** New tab next to Board — same data, different lens. Six fixed triage lanes derived from session metadata: *Needs decision*, *Blocked*, *Cost spike*, *Stale but important*, *Idle automations*, *Fresh*. A session can appear in multiple lanes (intentional for triage). Each card shows a lane-match hint in its corner so you can see *why* it's there. Cards keep their click-to-expand, label-edit, open-in-Craft, and batch-select behaviour from the Board.
+- **`assign_queue_lanes(session, ws_median, now_ms)`** helper, plus `_workspace_cost_medians` for per-workspace cost-spike detection (median computed over sessions with cost > 0; needs ≥3 paid sessions before the lane fires for that workspace, so noise from cold workspaces stays suppressed).
+- **`queueLanes` payload** — `build_data()` now emits the lane definitions and attaches a `lanes` array to each open session. Auto-refresh keeps lane assignments fresh when sessions move, get relabelled, or accumulate cost.
+
+### Notes
+
+- The Queue view is read-only with respect to lanes (lanes are derived, not editable). Drag-and-drop is not enabled in Queue — there's no canonical drop target for a derived lane. Use the Board for status changes; use Queue for triage.
+
+## [2.3.0] — 2026-04-25
+
+### Added
+
+- **Workspace Health view.** New tab next to Board and Archive — a portfolio-level read on every workspace. Each workspace gets a card showing open count, stale (7d+) count, total cost, a 14-day open/cost trend sparkline, review backlog (count + age of oldest), idle automations, and a health badge: `healthy`, `attention`, or `overloaded`. Click a card to drill into the Board pre-filtered to that workspace.
+- **Daily snapshots** at `~/.craft-agent/workspaces/.mission-control/history.jsonl`. One line per (workspace, date), retained for 14 days, written idempotently when `build_data()` runs. The first snapshot writes today; the trend fills in over time.
+- **Health badge thresholds** (constants at the top of `dashboard.py`): >20 open → overloaded; >5 stale or any review > 3d → attention; else healthy. Deliberately fixed in this release.
+
+### Changed
+
+- **`build_data()` now emits a `health` payload** alongside `workspaces` and `sessions`. Auto-refresh keeps it fresh. The history file is mtime-cached so the 3-second poll doesn't re-parse it on every tick.
+
 ## [2.2.0] — 2026-04-17
 
 ### Added

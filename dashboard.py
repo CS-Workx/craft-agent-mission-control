@@ -9,7 +9,7 @@ Usage:
 Server mode enables drag-and-drop status changes via a local API.
 """
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"
 
 import json
 import logging
@@ -21,7 +21,7 @@ import tempfile
 import time
 import threading
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -293,11 +293,102 @@ def build_data(workspaces, now_ms=None):
                 "sdkSid": sess.get("sdkSessionId", ""),
             })
 
+    health = _compute_health(ws_list, sessions, color_map, now_ms)
+
+    closed_status_ids = set()
+    for ws in ws_list:
+        for s in ws["statuses"]:
+            if s.get("category") == "closed":
+                closed_status_ids.add(s["id"])
+    medians = _workspace_cost_medians(sessions, closed_status_ids)
+    for s in sessions:
+        if s["status"] in closed_status_ids:
+            s["lanes"] = []
+            continue
+        s["lanes"] = _assign_queue_lanes(s, medians.get(s["wsId"]), now_ms)
+
     return {
         "now": now_ms,
         "workspaces": ws_list,
         "sessions": sessions,
+        "health": health,
+        "queueLanes": QUEUE_LANES,
+        "stockLenses": STOCK_LENSES,
     }
+
+
+def _compute_health(ws_list, sessions, color_map, now_ms):
+    """Build the per-workspace health payload, write today's snapshot if
+    needed, and attach the 14-day trend. Returns a list of cards keyed by
+    workspace id, ordered the same as ws_list."""
+    closed_status_ids = set()
+    for ws in ws_list:
+        for s in ws["statuses"]:
+            if s.get("category") == "closed":
+                closed_status_ids.add(s["id"])
+
+    # Group sessions by workspace once.
+    by_ws = {}
+    for s in sessions:
+        by_ws.setdefault(s["wsId"], []).append(s)
+
+    summaries = []
+    for ws in ws_list:
+        ws_sessions = by_ws.get(ws["id"], [])
+        open_sessions = [s for s in ws_sessions if s["status"] not in closed_status_ids]
+        cost = sum((s.get("cost") or 0) for s in ws_sessions)
+        stale_count = 0
+        review_count = 0
+        review_oldest_ms = 0
+        automation_stale = 0
+        for s in open_sessions:
+            last = s.get("lastUsedAt") or 0
+            age_ms = (now_ms - last) if last else now_ms
+            age_days = age_ms / 86400000
+            if age_days >= 7:
+                stale_count += 1
+            if s["status"] == "needs-review":
+                review_count += 1
+                if last and (now_ms - last) > review_oldest_ms:
+                    review_oldest_ms = now_ms - last
+            if s["status"] == "automated" and age_ms > HEALTH_AUTOMATION_STALE_HOURS * 3600000:
+                automation_stale += 1
+        review_oldest_days = int(review_oldest_ms / 86400000) if review_oldest_ms else 0
+        summaries.append({
+            "id": ws["id"],
+            "name": ws["name"],
+            "open": len(open_sessions),
+            "stale": stale_count,
+            "cost": cost,
+            "review": {"count": review_count, "oldestDays": review_oldest_days},
+            "automationStale": automation_stale,
+        })
+
+    # Persist today's open + cost snapshot before reading the trend, so today
+    # shows up in the sparkline.
+    _record_snapshot_if_needed(summaries)
+    history = _read_history()
+
+    cards = []
+    for ws, summary in zip(ws_list, summaries):
+        cl, cd = color_map.get(ws["id"], ("#888", "#aaa"))
+        badge = _compute_health_badge(
+            summary["open"], summary["stale"], summary["review"]["oldestDays"]
+        )
+        cards.append({
+            "id": ws["id"],
+            "name": ws["name"],
+            "cl": cl,
+            "cd": cd,
+            "open": summary["open"],
+            "stale": summary["stale"],
+            "cost": round(summary["cost"], 2),
+            "review": summary["review"],
+            "automationStale": summary["automationStale"],
+            "trend": _build_trend(history, ws["id"]),
+            "badge": badge,
+        })
+    return cards
 
 
 # ─── Status Update ──────────────────────────────────────────────────────────
@@ -426,6 +517,280 @@ def get_alerts():
                 "status": s["status"],
             })
     return alerts
+
+
+# ─── Workspace Health (v2.3) ─────────────────────────────────────────────────
+
+# Daily snapshots feed the 14-day trend sparklines on the Health tab. One line
+# per (workspace, date), retained for the trend window only. Lives alongside
+# Mission Control's other local state.
+HEALTH_TREND_DAYS = 14
+HEALTH_OVERLOADED_OPEN = 20
+HEALTH_ATTENTION_STALE = 5
+HEALTH_ATTENTION_REVIEW_DAYS = 3
+HEALTH_AUTOMATION_STALE_HOURS = 24
+
+_HISTORY_CACHE = None  # (mtime_ns, [records])
+
+
+def _mc_state_dir():
+    """Local-state directory for Mission Control (history, saved lenses, ...)."""
+    return WORKSPACES_DIR / ".mission-control"
+
+
+def _history_path():
+    return _mc_state_dir() / "history.jsonl"
+
+
+def _today_iso():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _read_history():
+    """Return all history records, mtime-cached so polling doesn't re-parse."""
+    global _HISTORY_CACHE
+    path = _history_path()
+    try:
+        st = path.stat()
+    except OSError:
+        _HISTORY_CACHE = (0, [])
+        return []
+    if _HISTORY_CACHE and _HISTORY_CACHE[0] == st.st_mtime_ns:
+        return _HISTORY_CACHE[1]
+    records = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except (ValueError, json.JSONDecodeError):
+                    pass
+    except OSError as e:
+        logger.warning("failed to read %s: %s", path, e)
+        return []
+    _HISTORY_CACHE = (st.st_mtime_ns, records)
+    return records
+
+
+def _record_snapshot_if_needed(ws_summaries, today=None):
+    """Append today's per-workspace snapshot (open + cost) if missing, and
+    trim records older than HEALTH_TREND_DAYS days. Idempotent within a day.
+    Skips quietly on any I/O failure — the dashboard degrades to no-trend mode.
+    """
+    today = today or _today_iso()
+    path = _history_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("failed to create %s: %s", path.parent, e)
+        return
+    records = _read_history()
+    have_today = {r.get("ws") for r in records if r.get("date") == today}
+    needs_write = any(s["id"] not in have_today for s in ws_summaries)
+    cutoff = (datetime.now() - timedelta(days=HEALTH_TREND_DAYS)).strftime("%Y-%m-%d")
+    needs_trim = any((r.get("date") or "") < cutoff for r in records)
+    if not needs_write and not needs_trim:
+        return
+    kept = [r for r in records if (r.get("date") or "") >= cutoff]
+    for s in ws_summaries:
+        if s["id"] in have_today:
+            continue
+        kept.append({
+            "date": today,
+            "ws": s["id"],
+            "open": s["open"],
+            "cost": round(s["cost"], 4),
+        })
+    lines = [json.dumps(r, separators=(",", ":")) + "\n" for r in kept]
+    try:
+        _atomic_write_lines(path, lines)
+    except OSError as e:
+        logger.warning("failed to write %s: %s", path, e)
+        return
+    # Force re-read on next access so the cache reflects what we just wrote.
+    global _HISTORY_CACHE
+    _HISTORY_CACHE = None
+
+
+def _build_trend(records, ws_id, days=HEALTH_TREND_DAYS):
+    """Return a `days`-long series oldest→newest with `null` for missing dates."""
+    by_date = {r.get("date"): r for r in records if r.get("ws") == ws_id}
+    today = datetime.now()
+    series = []
+    for i in range(days - 1, -1, -1):
+        d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        rec = by_date.get(d)
+        series.append({
+            "d": d,
+            "open": rec.get("open") if rec else None,
+            "cost": rec.get("cost") if rec else None,
+        })
+    return series
+
+
+def _compute_health_badge(open_count, stale_count, review_oldest_days):
+    if open_count > HEALTH_OVERLOADED_OPEN:
+        return "overloaded"
+    if stale_count > HEALTH_ATTENTION_STALE or review_oldest_days > HEALTH_ATTENTION_REVIEW_DAYS:
+        return "attention"
+    return "healthy"
+
+
+# ─── Queue Lanes (v2.4) ──────────────────────────────────────────────────────
+
+# Triage-first re-grouping of open sessions. A session can appear in multiple
+# lanes — that's intentional for triage. Lane order here is the display order.
+QUEUE_LANES = [
+    {"id": "needs-decision", "label": "Needs decision",
+     "hint": "status is needs-review"},
+    {"id": "blocked", "label": "Blocked",
+     "hint": "labelled blocked or waiting-on"},
+    {"id": "cost-spike", "label": "Cost spike",
+     "hint": "cost > workspace median \u00d7 3"},
+    {"id": "stale-important", "label": "Stale but important",
+     "hint": "stale 7d+ AND priority/important/client label"},
+    {"id": "idle-automation", "label": "Idle automations",
+     "hint": "automated AND idle 24h+"},
+    {"id": "fresh", "label": "Fresh",
+     "hint": "created in last 24h"},
+]
+QUEUE_COST_SPIKE_MULT = 3
+QUEUE_COST_SPIKE_MIN_SAMPLES = 3
+
+
+def _workspace_cost_medians(sessions, closed_status_ids):
+    """Median cost per workspace, computed over non-closed sessions whose cost
+    is > 0 — zero-cost sessions would drag the threshold down to noise."""
+    by_ws = {}
+    for s in sessions:
+        if s["status"] in closed_status_ids:
+            continue
+        cost = s.get("cost") or 0
+        if cost <= 0:
+            continue
+        by_ws.setdefault(s["wsId"], []).append(cost)
+    medians = {}
+    for ws_id, costs in by_ws.items():
+        if len(costs) < QUEUE_COST_SPIKE_MIN_SAMPLES:
+            medians[ws_id] = None
+            continue
+        ordered = sorted(costs)
+        n = len(ordered)
+        medians[ws_id] = ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+    return medians
+
+
+def _has_label_with_prefix(raw_labels, prefixes):
+    """True if any raw label matches one of the prefixes (exact or `prefix::*`)."""
+    for lb in raw_labels or []:
+        for p in prefixes:
+            if lb == p or lb.startswith(p + "::"):
+                return True
+    return False
+
+
+def _lenses_path():
+    return _mc_state_dir() / "lenses.json"
+
+
+# Built-in lenses are codified predicates evaluated client-side. Display order
+# mirrors this list. User lenses are appended after a divider.
+STOCK_LENSES = [
+    {"id": "stale-7d", "name": "Stale > 7d, not done", "kind": "stock"},
+    {"id": "no-labels", "name": "No labels", "kind": "stock"},
+    {"id": "cost-idle", "name": "Cost > $5 and idle > 24h", "kind": "stock"},
+    {"id": "needs-review", "name": "Needs Review (any workspace)", "kind": "stock"},
+    {"id": "active-24h", "name": "Active in last 24h", "kind": "stock"},
+    {"id": "abandoned", "name": "Abandoned (\u22641 msg, idle 24h+)", "kind": "stock"},
+]
+MAX_USER_LENSES = 50
+MAX_LENS_NAME_LEN = 80
+LENS_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+def read_user_lenses():
+    """Return the saved user lenses, or [] if none."""
+    path = _lenses_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        logger.warning("failed to parse %s: %s", path, e)
+        return []
+    if not isinstance(data, list):
+        return []
+    return [l for l in data if isinstance(l, dict)]
+
+
+def write_user_lenses(lenses):
+    """Replace saved user lenses with the given list. Validates each entry;
+    returns (ok, error_or_count)."""
+    if not isinstance(lenses, list):
+        return False, "Body must be a list"
+    if len(lenses) > MAX_USER_LENSES:
+        return False, f"Too many lenses (max {MAX_USER_LENSES})"
+    cleaned = []
+    seen_ids = set()
+    for lens in lenses:
+        if not isinstance(lens, dict):
+            return False, "Each lens must be an object"
+        lid = lens.get("id")
+        name = lens.get("name")
+        if not isinstance(lid, str) or not LENS_ID_RE.match(lid):
+            return False, f"Invalid lens id: {lid!r}"
+        if lid in seen_ids:
+            return False, f"Duplicate lens id: {lid}"
+        seen_ids.add(lid)
+        if not isinstance(name, str) or not (0 < len(name) <= MAX_LENS_NAME_LEN):
+            return False, "Invalid lens name"
+        ws = lens.get("ws", "all")
+        if not isinstance(ws, str) or len(ws) > 64:
+            return False, "Invalid lens ws"
+        search = lens.get("search", "") or ""
+        if not isinstance(search, str) or len(search) > 200:
+            return False, "Invalid lens search"
+        sort = lens.get("sort", "activity")
+        if sort not in ("activity", "name", "cost", "messages", "staleness"):
+            return False, "Invalid lens sort"
+        cleaned.append({"id": lid, "name": name, "ws": ws, "search": search, "sort": sort, "kind": "user"})
+    path = _lenses_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_lines(path, [json.dumps(cleaned, separators=(",", ":"))])
+    except OSError as e:
+        return False, str(e)
+    return True, len(cleaned)
+
+
+def _assign_queue_lanes(s, ws_median, now_ms):
+    """Return the list of lane ids this session belongs to."""
+    raw = s.get("rawLabels") or []
+    lanes = []
+    if s["status"] == "needs-review":
+        lanes.append("needs-decision")
+    if _has_label_with_prefix(raw, ["blocked"]) or any(
+        lb.startswith("waiting-on") for lb in raw
+    ):
+        lanes.append("blocked")
+    cost = s.get("cost") or 0
+    if ws_median and cost > ws_median * QUEUE_COST_SPIKE_MULT:
+        lanes.append("cost-spike")
+    last = s.get("lastUsedAt") or 0
+    age_ms = (now_ms - last) if last else now_ms
+    if age_ms >= 7 * 86400000 and _has_label_with_prefix(
+        raw, ["priority", "important", "client"]
+    ):
+        lanes.append("stale-important")
+    if s["status"] == "automated" and age_ms > 86400000:
+        lanes.append("idle-automation")
+    created = s.get("createdAt") or 0
+    if created and (now_ms - created) < 86400000 and s["status"] in ("idea", "todo"):
+        lanes.append("fresh")
+    return lanes
 
 
 # ─── HTML Template ───────────────────────────────────────────────────────────
@@ -717,6 +1082,109 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
   background:var(--input-bg);color:var(--tx);cursor:pointer
 }}
 .archive-page button:disabled{{opacity:.3;cursor:default}}
+
+/* ─── v2.3: Workspace Health ─────────────────────────── */
+.health-view{{display:none}}
+.health-view.active{{display:block}}
+.health-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}}
+.health-card{{
+  background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r);
+  padding:16px;box-shadow:var(--sh);cursor:pointer;transition:all .15s;
+  display:flex;flex-direction:column;gap:10px
+}}
+.health-card:hover{{box-shadow:var(--sh2);border-color:var(--bd2)}}
+.h-head{{display:flex;align-items:center;gap:10px}}
+.h-swatch{{width:14px;height:14px;border-radius:4px;flex-shrink:0}}
+.h-name{{font-size:14px;font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.h-badge{{
+  font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+  padding:2px 8px;border-radius:10px
+}}
+.h-badge.healthy{{background:var(--oks);color:var(--ok)}}
+.h-badge.attention{{background:var(--wns);color:var(--wn)}}
+.h-badge.overloaded{{background:var(--ers);color:var(--er)}}
+.h-stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}
+.h-stat{{display:flex;flex-direction:column;gap:1px}}
+.h-stat-v{{font-size:18px;font-weight:700;letter-spacing:-.02em}}
+.h-stat-l{{font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.04em;color:var(--tx3)}}
+.h-stat.warn .h-stat-v{{color:var(--wn)}}
+.h-stat.danger .h-stat-v{{color:var(--er)}}
+.h-trend{{display:flex;flex-direction:column;gap:4px}}
+.h-trend-row{{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--tx3)}}
+.h-trend-l{{width:36px;font-weight:500}}
+.h-trend-svg{{flex:1;height:24px;display:block}}
+.h-trend-svg .h-line{{fill:none;stroke:var(--ac);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}}
+.h-trend-svg .h-line-cost{{stroke:var(--wn)}}
+.h-trend-svg .h-dot{{fill:var(--ac)}}
+.h-trend-svg .h-dot-cost{{fill:var(--wn)}}
+.h-trend-svg .h-axis{{stroke:var(--bd);stroke-width:1;opacity:.5}}
+.h-extra{{font-size:11px;color:var(--tx3);display:flex;justify-content:space-between;border-top:1px solid var(--bd);padding-top:8px;margin-top:auto}}
+.h-extra strong{{color:var(--tx2);font-weight:600}}
+.h-empty{{text-align:center;padding:48px 24px;color:var(--tx3);font-size:13px}}
+
+/* ─── v2.4: Queue ────────────────────────────────────── */
+.queue-view{{display:none}}
+.queue-view.active{{display:block}}
+.queue-board{{display:flex;gap:16px;overflow-x:auto;padding-bottom:16px;align-items:flex-start}}
+.q-col{{flex:0 0 300px;width:300px}}
+.q-col-head{{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:8px 12px;margin-bottom:8px;border-radius:var(--rs);
+  background:var(--acs)
+}}
+.q-col-head .col-title{{font-size:13px;font-weight:600}}
+.q-col-head .col-count{{
+  font-size:12px;font-weight:600;color:var(--ac);
+  background:var(--bg);padding:1px 8px;border-radius:10px
+}}
+.q-col-hint{{font-size:11px;color:var(--tx3);padding:0 12px 6px;font-style:italic}}
+.q-col-cards{{display:flex;flex-direction:column;gap:8px;min-height:60px}}
+.q-card-wrap{{position:relative}}
+.q-lane-hint{{
+  position:absolute;top:8px;right:10px;z-index:2;
+  font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+  padding:2px 6px;border-radius:10px;background:var(--acs);color:var(--ac);pointer-events:none
+}}
+.q-empty{{text-align:center;padding:24px 12px;color:var(--tx3);font-size:12px;font-style:italic}}
+
+/* ─── v3.0: Saved Lenses ─────────────────────────────── */
+.lens-wrap{{position:relative}}
+.lens-btn{{
+  padding:7px 14px;border-radius:8px;border:1px solid var(--bd);
+  background:var(--input-bg);color:var(--tx);font-size:13px;font-weight:500;
+  cursor:pointer;outline:none;display:inline-flex;align-items:center;gap:6px;transition:all .15s
+}}
+.lens-btn:hover{{border-color:var(--ac);color:var(--ac)}}
+.lens-btn.active{{background:var(--acs);border-color:var(--ac);color:var(--ac)}}
+.lens-btn svg{{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}}
+.lens-menu{{
+  position:absolute;z-index:60;top:100%;left:0;margin-top:4px;min-width:260px;max-width:320px;
+  background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r);box-shadow:var(--sh2);padding:4px
+}}
+.lens-section{{
+  font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+  color:var(--tx3);padding:8px 10px 4px
+}}
+.lens-item{{
+  display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:6px;cursor:pointer;
+  font-size:13px;transition:background .1s
+}}
+.lens-item:hover{{background:var(--acs)}}
+.lens-item.current{{color:var(--ac);font-weight:600}}
+.lens-item-name{{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.lens-del{{
+  width:18px;height:18px;border-radius:4px;border:none;background:transparent;color:var(--tx3);
+  cursor:pointer;display:none;align-items:center;justify-content:center;font-size:14px;line-height:1
+}}
+.lens-item:hover .lens-del{{display:inline-flex}}
+.lens-del:hover{{background:var(--ers);color:var(--er)}}
+.lens-divider{{height:1px;background:var(--bd);margin:4px 0}}
+.lens-action{{
+  display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:6px;cursor:pointer;
+  font-size:13px;color:var(--tx2);font-weight:500
+}}
+.lens-action:hover{{background:var(--acs);color:var(--ac)}}
+.lens-empty{{padding:7px 10px;font-size:12px;color:var(--tx3);font-style:italic}}
 </style>
 </head>
 <body>
@@ -737,9 +1205,17 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
       <option value="all">All Workspaces</option>
     </select>
 
+    <div class="lens-wrap">
+      <button class="lens-btn" id="lens-btn" title="Apply a saved lens or filter">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <span id="lens-btn-label">Lens</span>
+      </button>
+    </div>
 
     <div class="view-tabs" id="view-tabs">
       <button class="view-tab active" data-view="board">Board</button>
+      <button class="view-tab" data-view="queue">Queue</button>
+      <button class="view-tab" data-view="health">Health</button>
       <button class="view-tab" data-view="archive">Archive</button>
     </div>
     <div class="toolbar-right">
@@ -789,6 +1265,16 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
     </div>
   </div>
 
+  <!-- Queue view (v2.4) -->
+  <div id="queue-view" class="queue-view">
+    <div class="queue-board" id="queue-board"></div>
+  </div>
+
+  <!-- Health view (v2.3) -->
+  <div id="health-view" class="health-view">
+    <div class="health-grid" id="health-grid"></div>
+  </div>
+
   <!-- Archive view -->
   <div id="archive-view" class="archive-view">
     <div class="archive-filters">
@@ -835,6 +1321,9 @@ h1{{font-size:20px;font-weight:700;letter-spacing:-.02em}}
 const DATA = {data_json};
 const API = "{api_base}";
 const NOW = Date.now();
+const HEALTH_ATTENTION_STALE = {HEALTH_ATTENTION_STALE};
+const HEALTH_ATTENTION_REVIEW_DAYS = {HEALTH_ATTENTION_REVIEW_DAYS};
+const HEALTH_OVERLOADED_OPEN = {HEALTH_OVERLOADED_OPEN};
 
 // ─── State ───────────────────────────────────────────
 const state = {{
@@ -855,6 +1344,11 @@ const state = {{
   archivePageSize: 25,
   // Feature 3: Label picker
   labelPicker: null,
+  // v3.0: Lenses
+  lens: null,                  // active lens id (stock or user)
+  lensKind: null,              // 'stock' or 'user'
+  userLenses: [],              // loaded from /api/lenses
+  lensMenu: null,              // open menu element
 }};
 
 // ─── Helpers ─────────────────────────────────────────
@@ -969,11 +1463,29 @@ function getAllStatuses() {{
   return result.sort((a,b) => (a.order||0) - (b.order||0));
 }}
 
+// v3.0: Stock lens predicates. User lenses restore filter state instead of
+// adding a predicate, so they don't appear here.
+function stockLensMatches(lensId, s, closedIds) {{
+  const last = s.lastUsedAt || 0;
+  const ageMs = NOW - last;
+  if (lensId === 'stale-7d') return last > 0 && !closedIds.has(s.status) && ageMs >= 7 * 86400000;
+  if (lensId === 'no-labels') return !((s.rawLabels||[]).length);
+  if (lensId === 'cost-idle') return (s.cost||0) > 5 && last > 0 && ageMs > 86400000;
+  if (lensId === 'needs-review') return s.status === 'needs-review';
+  if (lensId === 'active-24h') return last > 0 && ageMs < 86400000;
+  if (lensId === 'abandoned') return (s.msgs||0) <= 1 && last > 0 && ageMs > 86400000;
+  return true;
+}}
+
 function matchesFilters(s) {{
   if (isManageMode()) {{
     if (s.wsId !== state.selectedWs) return false;
   }} else {{
     if (!state.activeWs.has(s.wsId)) return false;
+  }}
+  if (state.lens && state.lensKind === 'stock') {{
+    const closedIds = new Set(getClosedStatuses().map(x => x.id));
+    if (!stockLensMatches(state.lens, s, closedIds)) return false;
   }}
   if (state.search) {{
     const q = state.search.toLowerCase();
@@ -1608,14 +2120,134 @@ function closeLabelPicker() {{
 function renderViewToggle() {{
   const boardView = document.getElementById('board-view');
   const archiveView = document.getElementById('archive-view');
+  const healthView = document.getElementById('health-view');
+  const queueView = document.getElementById('queue-view');
+  // Reset all
+  boardView.style.display = 'none';
+  archiveView.className = 'archive-view';
+  healthView.className = 'health-view';
+  queueView.className = 'queue-view';
   if (state.view === 'archive') {{
-    boardView.style.display = 'none';
     archiveView.className = 'archive-view active';
     renderArchive();
+  }} else if (state.view === 'health') {{
+    healthView.className = 'health-view active';
+    renderHealth();
+  }} else if (state.view === 'queue') {{
+    queueView.className = 'queue-view active';
+    renderQueue();
   }} else {{
     boardView.style.display = '';
-    archiveView.className = 'archive-view';
   }}
+}}
+
+// v2.4: Queue tab — six fixed lanes derived from session metadata
+function renderQueue() {{
+  const board = document.getElementById('queue-board');
+  const lanes = (DATA.queueLanes || []);
+  if (!lanes.length) {{
+    board.innerHTML = '<div class="q-empty">No queue lanes configured.</div>';
+    return;
+  }}
+  // Sessions visible in the queue obey the same workspace filter and search
+  // as the Board, but ignore status (lanes ARE the grouping).
+  const visible = DATA.sessions.filter(s => (s.lanes||[]).length && matchesFilters(s));
+  const sortKey = state.sort;
+  board.innerHTML = lanes.map(lane => {{
+    const matches = visible.filter(s => (s.lanes||[]).includes(lane.id)).sort(sortFn(sortKey));
+    const cards = matches.length
+      ? matches.map(s => renderQueueCard(s, lane.id)).join('')
+      : '<div class="q-empty">Nothing here.</div>';
+    return `<div class="q-col" data-lane="${{esc(lane.id)}}">
+      <div class="q-col-head">
+        <span class="col-title">${{esc(lane.label)}}</span>
+        <span class="col-count">${{matches.length}}</span>
+      </div>
+      <div class="q-col-hint">${{esc(lane.hint||'')}}</div>
+      <div class="q-col-cards">${{cards}}</div>
+    </div>`;
+  }}).join('');
+}}
+
+function renderQueueCard(s, laneId) {{
+  // Build a fresh card element wrapped with the lane hint. We don't reuse the
+  // FLIP registry here (cards may appear in multiple lanes) — the click
+  // handlers are delegated from the queue board so this stays cheap.
+  const expanded = state.expanded === s.id;
+  const draggable = false; // Queue is a derived view; no drag-and-drop here.
+  const isSelected = state.selected.has(cardKey(s));
+  const cls = 'card' + (expanded ? ' expanded' : '') + (isSelected ? ' selected' : '');
+  return `<div class="q-card-wrap">
+    <span class="q-lane-hint">${{esc(laneId.replace(/-/g,' '))}}</span>
+    <div class="${{cls}}" data-id="${{esc(s.id)}}" data-ws="${{esc(s.wsId)}}">${{buildCardInnerHTML(s)}}</div>
+  </div>`;
+}}
+
+// v2.3: Workspace Health
+function sparkline(series, key, klass) {{
+  // Render a polyline + dots through non-null entries. Width fills container.
+  const W = 160, H = 24, PAD = 2;
+  const vals = series.map(p => p[key]);
+  const present = vals.filter(v => v !== null && v !== undefined);
+  if (!present.length) return `<svg class="h-trend-svg" viewBox="0 0 ${{W}} ${{H}}" preserveAspectRatio="none"></svg>`;
+  const min = Math.min(...present), max = Math.max(...present);
+  const range = max - min || 1;
+  const step = (W - PAD * 2) / Math.max(1, series.length - 1);
+  let path = '', dots = '';
+  let prevPresent = false;
+  series.forEach((p, i) => {{
+    const v = p[key];
+    if (v === null || v === undefined) {{ prevPresent = false; return; }}
+    const x = PAD + i * step;
+    const y = H - PAD - ((v - min) / range) * (H - PAD * 2);
+    path += (prevPresent ? ' L ' : ' M ') + x.toFixed(1) + ' ' + y.toFixed(1);
+    if (i === series.length - 1) dots += `<circle class="h-dot ${{klass}}" cx="${{x.toFixed(1)}}" cy="${{y.toFixed(1)}}" r="2"/>`;
+    prevPresent = true;
+  }});
+  return `<svg class="h-trend-svg" viewBox="0 0 ${{W}} ${{H}}" preserveAspectRatio="none">
+    <path class="h-line ${{klass||''}}" d="${{path.trim()}}"/>${{dots}}
+  </svg>`;
+}}
+
+function renderHealth() {{
+  const grid = document.getElementById('health-grid');
+  const cards = (DATA.health || []);
+  if (!cards.length) {{
+    grid.innerHTML = '<div class="h-empty">No workspace data yet.</div>';
+    return;
+  }}
+  const dark = isDark();
+  grid.innerHTML = cards.map(c => {{
+    const swatch = dark ? c.cd : c.cl;
+    const staleClass = c.stale > HEALTH_ATTENTION_STALE ? 'danger' : c.stale > 0 ? 'warn' : '';
+    const reviewClass = c.review.oldestDays > HEALTH_ATTENTION_REVIEW_DAYS ? 'warn' : '';
+    const reviewSummary = c.review.count
+      ? `<strong>${{c.review.count}}</strong> review${{c.review.count!==1?'s':''}}, oldest ${{c.review.oldestDays}}d`
+      : 'No review backlog';
+    const automationLine = c.automationStale
+      ? `<strong>${{c.automationStale}}</strong> automation${{c.automationStale!==1?'s':''}} idle 24h+`
+      : '';
+    return `<div class="health-card" data-ws="${{esc(c.id)}}">
+      <div class="h-head">
+        <span class="h-swatch" style="background:${{swatch}}"></span>
+        <span class="h-name">${{esc(c.name)}}</span>
+        <span class="h-badge ${{c.badge}}">${{c.badge}}</span>
+      </div>
+      <div class="h-stats">
+        <div class="h-stat"><span class="h-stat-v">${{c.open}}</span><span class="h-stat-l">Open</span></div>
+        <div class="h-stat ${{staleClass}}"><span class="h-stat-v">${{c.stale}}</span><span class="h-stat-l">Stale 7d+</span></div>
+        <div class="h-stat"><span class="h-stat-v">$${{c.cost.toFixed(2)}}</span><span class="h-stat-l">Cost</span></div>
+      </div>
+      <div class="h-trend">
+        <div class="h-trend-row"><span class="h-trend-l">Open</span>${{sparkline(c.trend, 'open', '')}}</div>
+        <div class="h-trend-row"><span class="h-trend-l">Cost</span>${{sparkline(c.trend, 'cost', 'h-line-cost')}}</div>
+      </div>
+      <div class="h-extra">
+        <span class="${{reviewClass}}">${{reviewSummary}}</span>
+        <span>${{automationLine}}</span>
+      </div>
+    </div>`;
+  }}).join('');
 }}
 
 function applyTheme() {{
@@ -1656,6 +2288,180 @@ function renderAll() {{
   renderClosed();
   renderViewToggle();
   renderBatchBar();
+  renderLensButton();
+}}
+
+// ─── v3.0: Lenses ────────────────────────────────────
+function renderLensButton() {{
+  const btn = document.getElementById('lens-btn');
+  const label = document.getElementById('lens-btn-label');
+  if (!btn) return;
+  const active = currentLens();
+  btn.classList.toggle('active', !!state.lens);
+  label.textContent = active ? active.name : 'Lens';
+}}
+
+function currentLens() {{
+  if (!state.lens) return null;
+  if (state.lensKind === 'stock') {{
+    return (DATA.stockLenses || []).find(l => l.id === state.lens) || null;
+  }}
+  return state.userLenses.find(l => l.id === state.lens) || null;
+}}
+
+function applyLens(lens) {{
+  // Stock lens: predicate filter, leaves ws/search/sort alone.
+  // User lens: restores ws/search/sort, no predicate.
+  if (lens.kind === 'user') {{
+    state.lens = lens.id;
+    state.lensKind = 'user';
+    state.selectedWs = lens.ws || 'all';
+    state.search = lens.search || '';
+    state.sort = lens.sort || 'activity';
+    document.getElementById('ws-select').value = state.selectedWs;
+    document.getElementById('search').value = state.search;
+    document.getElementById('sort').value = state.sort;
+  }} else {{
+    state.lens = lens.id;
+    state.lensKind = 'stock';
+  }}
+  state.expanded = null;
+  syncLensUrl();
+  closeLensMenu();
+  renderAll();
+}}
+
+function clearLens() {{
+  state.lens = null;
+  state.lensKind = null;
+  syncLensUrl();
+  closeLensMenu();
+  renderAll();
+}}
+
+function syncLensUrl() {{
+  // Keep the URL bookmarkable. We replace state to avoid history pollution.
+  const url = new URL(window.location.href);
+  if (state.lens) url.searchParams.set('lens', state.lens);
+  else url.searchParams.delete('lens');
+  history.replaceState(null, '', url.toString());
+}}
+
+function slugify(name) {{
+  return (name||'').toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60) || 'lens';
+}}
+
+async function saveCurrentAsLens() {{
+  closeLensMenu();
+  const name = (prompt('Lens name?') || '').trim();
+  if (!name) return;
+  // Avoid colliding with stock lens ids.
+  const stockIds = new Set((DATA.stockLenses||[]).map(l => l.id));
+  let id = slugify(name);
+  if (stockIds.has(id) || state.userLenses.some(l => l.id === id)) {{
+    id = id + '-' + Date.now().toString(36);
+  }}
+  const lens = {{
+    id, name, kind: 'user',
+    ws: state.selectedWs,
+    search: state.search,
+    sort: state.sort,
+  }};
+  const next = [...state.userLenses, lens];
+  const ok = await postLenses(next);
+  if (ok) {{
+    toast('Saved lens "' + name + '"');
+    state.userLenses = next.map(l => ({{ ...l, kind: 'user' }}));
+    applyLens(lens);
+  }}
+}}
+
+async function deleteUserLens(lensId) {{
+  const next = state.userLenses.filter(l => l.id !== lensId);
+  const ok = await postLenses(next);
+  if (ok) {{
+    state.userLenses = next;
+    if (state.lens === lensId) clearLens();
+    else renderLensMenu(); // refresh menu if open
+    toast('Lens deleted');
+  }}
+}}
+
+async function postLenses(lenses) {{
+  if (!API) {{ toast('Server mode required to save lenses', 'error'); return false; }}
+  try {{
+    const res = await fetch(API + '/api/lenses', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ lenses }}),
+    }});
+    const data = await res.json();
+    if (!data.ok) {{ toast(data.error || 'Save failed', 'error'); return false; }}
+    return true;
+  }} catch (e) {{
+    toast('Connection error: ' + e.message, 'error');
+    return false;
+  }}
+}}
+
+async function loadUserLenses() {{
+  if (!API) return;
+  try {{
+    const res = await fetch(API + '/api/lenses');
+    const data = await res.json();
+    if (data.ok && Array.isArray(data.lenses)) {{
+      state.userLenses = data.lenses.map(l => ({{ ...l, kind: 'user' }}));
+    }}
+  }} catch (_) {{}}
+}}
+
+function openLensMenu() {{
+  closeLensMenu();
+  const wrap = document.querySelector('.lens-wrap');
+  if (!wrap) return;
+  const menu = document.createElement('div');
+  menu.className = 'lens-menu';
+  state.lensMenu = menu;
+  wrap.appendChild(menu);
+  renderLensMenu();
+}}
+
+function closeLensMenu() {{
+  if (state.lensMenu) {{
+    state.lensMenu.remove();
+    state.lensMenu = null;
+  }}
+}}
+
+function renderLensMenu() {{
+  if (!state.lensMenu) return;
+  const stock = (DATA.stockLenses || []);
+  const user = state.userLenses;
+  const cur = state.lens;
+  let html = '<div class="lens-section">Stock</div>';
+  html += stock.map(l =>
+    `<div class="lens-item ${{cur===l.id?'current':''}}" data-lens-id="${{esc(l.id)}}" data-lens-kind="stock">
+      <span class="lens-item-name">${{esc(l.name)}}</span>
+    </div>`
+  ).join('');
+  html += '<div class="lens-divider"></div><div class="lens-section">Saved</div>';
+  if (user.length) {{
+    html += user.map(l =>
+      `<div class="lens-item ${{cur===l.id?'current':''}}" data-lens-id="${{esc(l.id)}}" data-lens-kind="user">
+        <span class="lens-item-name">${{esc(l.name)}}</span>
+        <button class="lens-del" data-del="${{esc(l.id)}}" title="Delete lens">\u00d7</button>
+      </div>`
+    ).join('');
+  }} else {{
+    html += '<div class="lens-empty">No saved lenses yet.</div>';
+  }}
+  html += '<div class="lens-divider"></div>';
+  html += '<div class="lens-action" data-action="save">+ Save current view as lens\u2026</div>';
+  if (cur) html += '<div class="lens-action" data-action="clear">Clear lens</div>';
+  state.lensMenu.innerHTML = html;
 }}
 
 // ─── Drag & Drop ─────────────────────────────────────
@@ -1855,6 +2661,96 @@ document.getElementById('view-tabs').addEventListener('click', e => {{
   renderViewToggle();
 }});
 
+// v3.0: Lens dropdown toggle + menu actions
+document.getElementById('lens-btn').addEventListener('click', e => {{
+  e.stopPropagation();
+  if (state.lensMenu) closeLensMenu();
+  else openLensMenu();
+}});
+
+document.addEventListener('click', e => {{
+  if (!state.lensMenu) return;
+  if (!state.lensMenu.contains(e.target) && !e.target.closest('#lens-btn')) {{
+    closeLensMenu();
+    return;
+  }}
+  const del = e.target.closest('[data-del]');
+  if (del) {{
+    e.stopPropagation();
+    if (confirm('Delete this lens?')) deleteUserLens(del.dataset.del);
+    return;
+  }}
+  const item = e.target.closest('.lens-item');
+  if (item) {{
+    const stock = (DATA.stockLenses || []).find(l => l.id === item.dataset.lensId);
+    const userLens = state.userLenses.find(l => l.id === item.dataset.lensId);
+    const lens = item.dataset.lensKind === 'stock' ? stock : userLens;
+    if (lens) applyLens(lens);
+    return;
+  }}
+  const action = e.target.closest('[data-action]');
+  if (action) {{
+    if (action.dataset.action === 'save') saveCurrentAsLens();
+    else if (action.dataset.action === 'clear') clearLens();
+  }}
+}});
+
+// v2.4: Queue board reuses the Board's card-click semantics
+document.getElementById('queue-board').addEventListener('click', e => {{
+  // Checkbox in select mode
+  const cb = e.target.closest('.card-check');
+  if (cb) {{
+    e.stopPropagation();
+    const card = cb.closest('.card');
+    const key = card.dataset.ws + ':' + card.dataset.id;
+    if (cb.checked) state.selected.add(key);
+    else state.selected.delete(key);
+    card.classList.toggle('selected', cb.checked);
+    renderBatchBar();
+    return;
+  }}
+  const labelBtn = e.target.closest('.label-btn');
+  if (labelBtn) {{
+    e.stopPropagation();
+    showLabelPicker(labelBtn.dataset.sid, labelBtn.dataset.ws, labelBtn);
+    return;
+  }}
+  const openBtn = e.target.closest('.open-btn');
+  if (openBtn) {{
+    e.stopPropagation();
+    openSession(openBtn);
+    return;
+  }}
+  const card = e.target.closest('.card');
+  if (!card) return;
+  if (state.selectMode) {{
+    const key = card.dataset.ws + ':' + card.dataset.id;
+    if (state.selected.has(key)) state.selected.delete(key);
+    else state.selected.add(key);
+    renderQueue();
+    renderBatchBar();
+    return;
+  }}
+  state.expanded = state.expanded === card.dataset.id ? null : card.dataset.id;
+  renderQueue();
+}});
+
+// v2.3: Health card click → switch to Board, scoped to that workspace
+document.getElementById('health-grid').addEventListener('click', e => {{
+  const card = e.target.closest('.health-card');
+  if (!card) return;
+  const wsId = card.dataset.ws;
+  if (!wsId) return;
+  state.selectedWs = wsId;
+  document.getElementById('ws-select').value = wsId;
+  state.view = 'board';
+  document.querySelectorAll('.view-tab').forEach(t => t.classList.toggle('active', t.dataset.view === 'board'));
+  state.expanded = null;
+  state.search = '';
+  document.getElementById('search').value = '';
+  renderAll();
+}});
+
 // Feature 5: Archive filters & sorting
 ['archive-status','archive-ws','archive-date'].forEach(id => {{
   document.getElementById(id).addEventListener('change', () => {{ state.archivePage = 0; renderArchive(); }});
@@ -1933,6 +2829,20 @@ if (urlWs && DATA.workspaces.some(w => w.id === urlWs)) {{
 renderAll();
 if (!API) toast('View-only mode (open via --serve for drag-and-drop)', 'error');
 
+// v3.0: load saved user lenses, then apply ?lens= if any matches.
+(async () => {{
+  await loadUserLenses();
+  const urlLens = new URLSearchParams(location.search).get('lens');
+  if (urlLens) {{
+    const stock = (DATA.stockLenses||[]).find(l => l.id === urlLens);
+    const user = state.userLenses.find(l => l.id === urlLens);
+    if (stock) applyLens(stock);
+    else if (user) applyLens(user);
+  }} else {{
+    renderLensButton();
+  }}
+}})();
+
 // ─── Auto-refresh (polling) ──────────────────────────
 // Signature captures only fields that affect board layout/appearance so we
 // skip re-renders when nothing interesting changed.
@@ -1967,6 +2877,7 @@ async function refreshData() {{
     DATA.sessions = fresh.sessions;
     if (Array.isArray(fresh.workspaces)) DATA.workspaces = fresh.workspaces;
     if (Array.isArray(fresh.statuses)) DATA.statuses = fresh.statuses;
+    if (Array.isArray(fresh.health)) DATA.health = fresh.health;
     renderAll();
   }} catch (_) {{
     // Network hiccup / abort; next tick will try again.
@@ -2106,6 +3017,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": "Missing ws param"})
             else:
                 self._json(200, {"ok": True, "labels": get_workspace_labels(ws_dir)})
+        elif path == "/api/lenses":
+            self._json(200, {"ok": True, "lenses": read_user_lenses()})
         elif path == "/health":
             self._json(200, {"ok": True, "version": __version__})
         else:
@@ -2177,6 +3090,19 @@ class Handler(BaseHTTPRequestHandler):
                     failed += 1
             self._refresh_data()
             self._json(200, {"ok": True, "updated": updated, "failed": failed})
+        elif path == "/api/lenses":
+            body = self._read_json_body()
+            if body is None:
+                return
+            lenses = body.get("lenses")
+            if lenses is None:
+                self._json(400, {"ok": False, "error": "Missing lenses"})
+                return
+            ok, result = write_user_lenses(lenses)
+            if ok:
+                self._json(200, {"ok": True, "saved": result, "lenses": read_user_lenses()})
+            else:
+                self._json(400, {"ok": False, "error": result})
         elif path == "/api/open-url":
             body = self._read_json_body()
             if body is None:
