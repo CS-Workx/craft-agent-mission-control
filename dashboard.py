@@ -9,7 +9,7 @@ Usage:
 Server mode enables drag-and-drop status changes via a local API.
 """
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 import json
 import logging
@@ -121,16 +121,21 @@ def collect():
     if not WORKSPACES_DIR.exists():
         return workspaces
 
-    # Read top-level config for workspace UUIDs (needed for deeplinks)
+    # Read top-level config for workspace UUIDs (needed for deeplinks).
+    # Key by the workspace DIRECTORY NAME (basename of rootPath), not slug:
+    # slugs can be stale or collide (the "Assistant" workspace carries slug
+    # "my-workspace", which would otherwise resolve to the unrelated
+    # "My workspace" UUID and open the wrong workspace on deeplink).
     app_uuid_map = {}
     top_config = CRAFT_DIR / "config.json"
     if top_config.exists():
         top_data = _read_json_file(top_config)
         if top_data:
             for ws_entry in top_data.get("workspaces", []):
-                slug = ws_entry.get("slug", "")
-                if slug:
-                    app_uuid_map[slug] = ws_entry.get("id", "")
+                root = ws_entry.get("rootPath", "")
+                dir_name = root.rstrip("/").split("/")[-1] if root else ""
+                if dir_name:
+                    app_uuid_map[dir_name] = ws_entry.get("id", "")
 
     for ws_dir in sorted(WORKSPACES_DIR.iterdir()):
         if not ws_dir.is_dir() or ws_dir.name.startswith("."):
@@ -158,7 +163,7 @@ def collect():
             "dir_name": ws_dir.name,
             "name": config.get("name", ws_dir.name),
             "ws_id": config.get("id", ""),
-            "app_uuid": app_uuid_map.get(config.get("slug", ws_dir.name), ""),
+            "app_uuid": app_uuid_map.get(ws_dir.name, ""),
             "statuses_raw": [],
             "labels": {},
             "sessions": [],

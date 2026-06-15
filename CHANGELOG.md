@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 _Nothing yet — see [ROADMAP.md](ROADMAP.md) for what's coming._
 
+## [3.0.1] — 2026-06-15
+
+### Fixed
+
+- **"Open" (and "New session") deeplinked to the wrong workspace.** `collect()` resolved each workspace's app-level UUID by matching on `slug`. When a workspace carries a stale or duplicate slug (e.g. the "Assistant" workspace whose `config.json` still has `slug: "my-workspace"`), the lookup collided with the unrelated "My workspace" entry and emitted its UUID. Opening any such session sent the user to the wrong workspace, where the session didn't exist. The UUID map is now keyed by the workspace **directory name** (the basename of each top-level `rootPath`), which is unique and always matches the folders `collect()` scans. Affects the Open button, the New session (+) button, and any other deeplink built from `app_uuid`.
+
 ## [3.0.0] — 2026-04-25
 
 The 3.0 release marks the completed shift from "kanban dashboard" to "operations layer" — same constraints (zero dependencies, single file, local-first), larger identity. Three sequential additions land here: Workspace Health (v2.3), Queue tab (v2.4), and Saved Lenses (this release).
