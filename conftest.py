@@ -39,3 +39,33 @@ def craft_home(tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard, "_HISTORY_CACHE", None)
 
     return craft_dir
+
+
+@pytest.fixture
+def mc_home(tmp_path, monkeypatch):
+    """Point mc.py at a throwaway ~/.craft-agent tree under tmp_path.
+
+    Returns a small handle with ``.workspaces`` (the Path) and a ``make_ws(slug)``
+    helper that creates a workspace directory with a minimal ``config.json`` so
+    ``mc.ws_dir()`` accepts it.
+    """
+    import mc
+
+    craft = tmp_path
+    workspaces = craft / "workspaces"
+    workspaces.mkdir()
+
+    monkeypatch.setattr(mc, "CRAFT_HOME", craft)
+    monkeypatch.setattr(mc, "WORKSPACES_DIR", workspaces)
+
+    class Handle:
+        def __init__(self, ws):
+            self.workspaces = ws
+
+        def make_ws(self, slug):
+            d = self.workspaces / slug
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "config.json").write_text("{}")
+            return d
+
+    return Handle(workspaces)
