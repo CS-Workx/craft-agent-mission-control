@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 _Nothing yet — see [ROADMAP.md](ROADMAP.md) for what's coming._
 
+## [3.1.0] — 2026-09-08
+
+### Added
+
+- **Cross-workspace agent tasking CLI (`mc.py`).** A zero-dependency companion to the dashboard for reading, triaging, and tasking work across every Craft Agents workspace from the command line: `list`, `queue`, `show`, `status`, `label`, `open`, `new`, `dispatch`, `dispatched`, and `cleanup`. Status and label commands fire the workspace's `SessionStatusChange` / `LabelAdd` automations (Tier 2); `dispatch` injects a one-shot prompt automation that spawns a live agent session in the target workspace (Tier 3). Ships with [ROUTING.md](ROUTING.md), a map of which workspace to task for a given job.
+- **Dispatch completion-status footer.** Every dispatched brief now gets a footer instructing the cold-started agent to set its session status to `needs-review` when done — whether it finished or got stuck — so the handoff is visible in status rather than buried in the transcript. `done` is deliberately not offered: an agent cannot set a closed status from its own session, so it reports and the dispatcher closes. Opt out with `--no-footer`; the footer is not double-appended if already present.
+
+### Safety
+
+- **`dispatch` is dry-run by default.** It prints the target workspace, fire time, and full brief, and only arms the live agent when re-run with `--go`.
+
 ## [3.0.1] — 2026-06-15
 
 ### Fixed

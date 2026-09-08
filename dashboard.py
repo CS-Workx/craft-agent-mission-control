@@ -9,7 +9,7 @@ Usage:
 Server mode enables drag-and-drop status changes via a local API.
 """
 
-__version__ = "3.0.1"
+__version__ = "3.1.0"
 
 import json
 import logging
