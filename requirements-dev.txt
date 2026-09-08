@@ -1,0 +1,4 @@
+# Dev-only tooling. The shipped app (dashboard.py, mc.py) has ZERO runtime
+# dependencies and never imports anything from here — this is exclusively for
+# running the test suite locally and in CI.
+pytest>=7.0
