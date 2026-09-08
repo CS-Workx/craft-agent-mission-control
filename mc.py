@@ -289,8 +289,23 @@ def _cron_at(when: str, tz: str) -> tuple[str, datetime]:
     return cron, fire
 
 
+# Appended to every dispatched brief. A cross-workspace agent starts cold and has no way
+# to know anyone is waiting on it; without this, finished work sits in `todo` and reads as
+# an open loop. `done` is deliberately not offered: an agent cannot set a closed status
+# from inside its own session, so it reports and the dispatcher closes.
+COMPLETION_FOOTER = """
+
+WHEN YOU ARE DONE
+Say so in the session, not just in your files. End by setting your session status to
+`needs-review`, whether you finished or got stuck, and say which it was in your last
+message. Leave the status alone only while you are still working. Whoever dispatched you
+is watching that status, not your transcript."""
+
+
 def cmd_dispatch(a):
     d = ws_dir(a.ws)
+    if not getattr(a, "no_footer", False) and COMPLETION_FOOTER.strip() not in a.prompt:
+        a.prompt = a.prompt.rstrip() + COMPLETION_FOOTER
     cron, fire = _cron_at(a.at, a.tz)
     auto_id = DISPATCH_ID_PREFIX + uuid.uuid4().hex[:8]
     name = a.name or f"{DISPATCH_NAME_PREFIX} {a.prompt[:48].strip()}"
@@ -423,6 +438,8 @@ def build_parser():
                    choices=["allow-all", "plan", "default", "ask", "acceptEdits"])
     s.add_argument("--model"); s.add_argument("--conn")
     s.add_argument("--name"); s.add_argument("--tz", default=DEFAULT_TZ)
+    s.add_argument("--no-footer", dest="no_footer", action="store_true",
+                   help="omit the 'set your session status when done' footer")
     s.add_argument("--go", action="store_true"); s.set_defaults(fn=cmd_dispatch)
 
     s = sub.add_parser("dispatched", help="list mc-injected one-shot automations")
